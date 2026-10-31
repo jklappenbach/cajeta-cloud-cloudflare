@@ -6,7 +6,7 @@ ports, written in Cajeta:
 | Port | Adapter | Status |
 |---|---|---|
 | object store | R2 through the shared S3 client, [cajeta-cloud-s3](https://github.com/jklappenbach/cajeta-cloud-s3) | `R2ObjectStore.connect(bucket, config)` |
-| identity (`TokenVerifier`) | Cloudflare Access application tokens | planned |
+| identity (`TokenVerifier`) | Cloudflare Access application tokens; every other identity operation refuses | `IDENTITY_PROVIDER=access` |
 | queue | Cloudflare Queues (pull consumers) | planned |
 | key-value | Workers KV | planned |
 
@@ -34,6 +34,15 @@ writes (`putIfAbsent`, `putIfMatch`) are declared only with
 bucket, and refuse cleanly otherwise. The skill `cloudflare-r2-object-store`
 covers the adapter's behaviour.
 
+Access forwards each request with a signed JWT; the `access` identity adapter
+verifies it (`AccessRequests.verify(verifier, request)` reads
+`Cf-Access-Jwt-Assertion` or the `CF_Authorization` cookie) against the
+team's certificate set, cached through the shared `JwksCache`, and turns it
+into the port's claims with the subject, email and forwarded groups. It takes
+`CLOUDFLARE_ACCESS_TEAM` and `CLOUDFLARE_ACCESS_AUD`, no secret, and refuses
+registration, sign-in and every other identity operation as unsupported.
+The skill `cloudflare-access-identity` covers it.
+
 **Status: in development (0.1.0 unreleased).** The spec and plan are
 `cajeta-cloud-cloudflare` in the cajeta repository's `specs/` and `agents/`.
 
@@ -45,7 +54,8 @@ covers the adapter's behaviour.
 
 The suite needs no Cloudflare account: R2 runs against `FakeS3` from
 cajeta-cloud-s3 with R2's part rule enforced, and the object-store
-conformance suite runs over it under both profiles. The same suite runs
+conformance suite runs over it under both profiles; Access runs against a
+fixture certificate set and tokens signed by it. The same suite runs
 against a real bucket when `CAJETA_R2_TEST_BUCKET` is set, with the chain's
 variables; `cloudflare-live.yml` does that on dispatch and fails if the live
 leg skips. Dependency archives resolve from `~/.olla` or Olla at the versions

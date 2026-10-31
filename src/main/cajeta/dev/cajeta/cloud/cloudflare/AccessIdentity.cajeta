@@ -1,0 +1,150 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+import dev.cajeta.cloud.Capabilities;
+import dev.cajeta.cloud.identity.Account;
+import dev.cajeta.cloud.identity.Attributes;
+import dev.cajeta.cloud.identity.Authenticator;
+import dev.cajeta.cloud.identity.IdentityCapability;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.cloud.identity.JwksSource;
+import dev.cajeta.cloud.identity.RegistrationResult;
+import dev.cajeta.cloud.identity.SystemTimeSource;
+import dev.cajeta.cloud.identity.TimeSource;
+import dev.cajeta.cloud.identity.TokenVerifier;
+import dev.cajeta.cloud.identity.User;
+import dev.cajeta.cloud.identity.UserPool;
+
+/**
+ * Cloudflare Access behind the identity port (spec 4): a verifier of the
+ * tokens Access forwards, and nothing else. Its capabilities declare JWKS
+ * only; every UserPool, Authenticator and Account operation refuses as
+ * UNSUPPORTED_CAPABILITY naming the operation, before any request (4.4).
+ * Access signs users in itself, through the team's identity providers, so
+ * there is no registration, password or factor to drive here.
+ *
+ * As the `access` component it configures itself on first use from
+ * CLOUDFLARE_ACCESS_TEAM and CLOUDFLARE_ACCESS_AUD (spec 7.3). Construction
+ * does nothing, so a program that selects another provider never touches
+ * Cloudflare.
+ */
+@Component(name = "access")
+public final class AccessIdentity implements UserPool {
+    AccessConfig config;
+    AccessTokenVerifier ver;
+    Capabilities caps;
+    AccessAuthenticator auth;
+    AccessAccount acct;
+    boolean ready;
+
+    /** The `access` component: configured from the environment on first use. */
+    public AccessIdentity() {
+        this.ready = false;
+        this.caps #= AccessIdentity.capabilitiesFor();
+        this.auth = heap AccessAuthenticator();
+        this.acct = heap AccessAccount();
+        return;
+    }
+
+    /** An adapter over the given certificate source and clock. */
+    public static #AccessIdentity over(AccessConfig config, #JwksSource source, #TimeSource clock) {
+        AccessIdentity id = heap AccessIdentity();
+        AccessConfig c #= AccessConfig.resolve(config);
+        id.config #= c;
+        id.ver = heap AccessTokenVerifier(id.config, #source, #clock);
+        id.ready = true;
+        return #id;
+    }
+
+    static #Capabilities capabilitiesFor() {
+        Capabilities c = heap Capabilities("access");
+        c.declare(IdentityCapability.JWKS(), "the team's certificate set at /cdn-cgi/access/certs");
+        return #c;
+    }
+
+    private void ensure() {
+        if (this.ready) return;
+        AccessConfig c #= AccessConfig.resolve(null);
+        this.config #= c;
+        String url #= this.config.certsUrl();
+        JwksSource source = heap AccessCertsSource(url);
+        TimeSource clock = heap SystemTimeSource();
+        this.ver = heap AccessTokenVerifier(this.config, #source, #clock);
+        this.ready = true;
+    }
+
+    public Capabilities capabilities() { return this.caps; }
+
+    public TokenVerifier verifier() {
+        this.ensure();
+        return this.ver;
+    }
+
+    public Authenticator authenticator() { return this.auth; }
+    public Account account() { return this.acct; }
+
+    static void refuse(String operation) {
+        throw heap IdentityException(IdentityException.UNSUPPORTED_CAPABILITY(), "access",
+            operation, "-", "Access verifies tokens only; users are managed by the team's identity providers");
+    }
+
+    public #RegistrationResult register(String username, String password) {
+        AccessIdentity.refuse("register");
+        return null;
+    }
+
+    public #RegistrationResult registerWith(String username, String password, Attributes attributes) {
+        AccessIdentity.refuse("registerWith");
+        return null;
+    }
+
+    public #RegistrationResult registerPasswordless(String username, Attributes attributes) {
+        AccessIdentity.refuse("registerPasswordless");
+        return null;
+    }
+
+    public void confirm(String username, String code) {
+        AccessIdentity.refuse("confirm");
+        return;
+    }
+
+    public #User lookupBySubject(String subject) {
+        AccessIdentity.refuse("lookupBySubject");
+        return null;
+    }
+
+    public #User lookupByName(String username) {
+        AccessIdentity.refuse("lookupByName");
+        return null;
+    }
+
+    public boolean delete(String subject) {
+        AccessIdentity.refuse("delete");
+        return false;
+    }
+
+    public void setAttribute(String subject, String name, String value) {
+        AccessIdentity.refuse("setAttribute");
+        return;
+    }
+
+    public void removeAttribute(String subject, String name) {
+        AccessIdentity.refuse("removeAttribute");
+        return;
+    }
+
+    public void addToGroup(String subject, String group) {
+        AccessIdentity.refuse("addToGroup");
+        return;
+    }
+
+    public void removeFromGroup(String subject, String group) {
+        AccessIdentity.refuse("removeFromGroup");
+        return;
+    }
+
+    public #String[] groups(String subject) {
+        AccessIdentity.refuse("groups");
+        return null;
+    }
+}

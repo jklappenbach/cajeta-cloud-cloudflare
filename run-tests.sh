@@ -122,4 +122,4 @@ echo ">> building + running the test binary"
     -o "$out/cftests" \
     dev.cajeta.cloud.cloudflare.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 
-CAJETA_CF_TEST_TMP="$out" "$out/cftests"
+ACCESS_FIXTURES="$here/src/test/resources/access" CAJETA_CF_TEST_TMP="$out" "$out/cftests"

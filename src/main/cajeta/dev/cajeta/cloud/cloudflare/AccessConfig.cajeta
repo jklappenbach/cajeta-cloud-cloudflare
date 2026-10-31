@@ -1,0 +1,85 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+
+/**
+ * What the Access verifier needs (spec 7.3): the team domain and the
+ * application's AUD tag; no secret. Declare one as a component, or leave a
+ * field null to take CLOUDFLARE_ACCESS_TEAM and CLOUDFLARE_ACCESS_AUD from
+ * the environment (`resolve`). The team may be given as its name
+ * (`example-team`), its domain (`example-team.cloudflareaccess.com`) or its
+ * URL; the issuer is always `https://<team>.cloudflareaccess.com`.
+ */
+public final class AccessConfig {
+    String team;
+    String audTag;
+
+    public AccessConfig(String teamDomain, String aud) {
+        if (teamDomain != null) this.team #= "" + teamDomain;
+        if (aud != null) this.audTag #= "" + aud;
+        return;
+    }
+
+    /** A complete config: `config`'s fields, each null one from the environment. */
+    public static #AccessConfig resolve(AccessConfig config) {
+        String team = null;
+        String aud = null;
+        if (config != null) {
+            team = config.teamDomain();
+            aud = config.aud();
+        }
+        if (CloudflareChain.blank(team)) {
+            String t #= CloudflareChain.env("CLOUDFLARE_ACCESS_TEAM");
+            if (t == null) {
+                throw heap CloudflareConfigurationException("no Access team domain: "
+                    + "AccessConfig.teamDomain is not set and CLOUDFLARE_ACCESS_TEAM is not set");
+            }
+            team = t;
+            if (CloudflareChain.blank(aud)) {
+                String a #= CloudflareChain.env("CLOUDFLARE_ACCESS_AUD");
+                if (a == null) {
+                    throw heap CloudflareConfigurationException("no Access application AUD tag: "
+                        + "AccessConfig.aud is not set and CLOUDFLARE_ACCESS_AUD is not set");
+                }
+                return heap AccessConfig(team, a);
+            }
+            return heap AccessConfig(team, aud);
+        }
+        if (CloudflareChain.blank(aud)) {
+            String a #= CloudflareChain.env("CLOUDFLARE_ACCESS_AUD");
+            if (a == null) {
+                throw heap CloudflareConfigurationException("no Access application AUD tag: "
+                    + "AccessConfig.aud is not set and CLOUDFLARE_ACCESS_AUD is not set");
+            }
+            return heap AccessConfig(team, a);
+        }
+        return heap AccessConfig(team, aud);
+    }
+
+    public String teamDomain() { return this.team; }
+    public String aud() { return this.audTag; }
+
+    /** `https://<team>.cloudflareaccess.com`, the `iss` of every token the team signs. */
+    public #String issuer() {
+        String t #= AccessConfig.teamName(this.team);
+        return "https://" + t + ".cloudflareaccess.com";
+    }
+
+    /** The team's certificate set: `<issuer>/cdn-cgi/access/certs`. */
+    public #String certsUrl() {
+        String iss #= this.issuer();
+        return iss + "/cdn-cgi/access/certs";
+    }
+
+    // The bare team name from a name, a domain or a URL.
+    static #String teamName(String given) {
+        String s #= "" + given;
+        int64 scheme = s.indexOf("://");
+        if (scheme >= 0L) s #= s.substring((int32) (scheme + 3L), s.byteLength());
+        int64 slash = s.indexOf("/");
+        if (slash >= 0L) s #= s.substring(0, (int32) slash);
+        int64 dot = s.indexOf(".");
+        if (dot >= 0L) s #= s.substring(0, (int32) dot);
+        return #s;
+    }
+}

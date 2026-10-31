@@ -15,7 +15,9 @@ repo carries no specs of its own.
 ```
 
 No test reaches Cloudflare by default: R2 runs against `FakeS3` with R2's
-part rule switched on. The live legs opt in through `CAJETA_R2_TEST_BUCKET`
+part rule switched on; Access against the fixture certificate set and tokens
+under `src/test/resources/access` (generated once by `generate.py` there,
+never regenerated). The live legs opt in through `CAJETA_R2_TEST_BUCKET`
 and the chain's variables (`cloudflare-live.yml`). `cajeta-cloud-s3` builds
 from a sibling checkout (`S3_REPO`) until it is on Olla; `cajeta-cloud` the
 same way (`CLOUD_REPO`) when the pinned version is not in `~/.olla`.

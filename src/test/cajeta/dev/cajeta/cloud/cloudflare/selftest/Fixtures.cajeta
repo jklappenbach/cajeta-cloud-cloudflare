@@ -1,0 +1,35 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+
+/** The Access fixtures under src/test/resources/access (ACCESS_FIXTURES, exported by run-tests.sh). */
+public final class Fixtures {
+    public static final int64 IAT = 1767225600L;
+    public static final int64 EXP = 1767312000L;
+    public static final String TEAM = "example-team";
+    public static final String AUD = "f5a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80";
+    public static final String SUB = "6d3f5b1e-2a4c-4f8e-9b0d-1c2e3f4a5b6c";
+
+    public static #String read(String name) {
+        String root #= System.env.get("ACCESS_FIXTURES");
+        if (root == null) {
+            Assert.fail("ACCESS_FIXTURES is not set; run through run-tests.sh");
+        }
+        String path #= root + "/" + name;
+        int8[] bytes #= File.readAllBytes(path);
+        if (bytes == null) {
+            Assert.fail("missing fixture " + path);
+        }
+        int32 n = (int32) bytes.count();
+        return heap String(#bytes, n);
+    }
+
+    public static #FixtureJwksSource certs(String file, int64 maxAge) {
+        FixtureJwksSource keys = heap FixtureJwksSource(maxAge);
+        String doc #= Fixtures.read(file);
+        keys.then(doc);
+        return #keys;
+    }
+}

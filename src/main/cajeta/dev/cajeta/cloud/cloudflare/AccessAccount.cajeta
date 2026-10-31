@@ -1,0 +1,50 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+import dev.cajeta.cloud.identity.Account;
+import dev.cajeta.cloud.identity.Attributes;
+import dev.cajeta.cloud.identity.TotpEnrollment;
+import dev.cajeta.cloud.identity.User;
+
+/** The Access adapter's account plane: every operation refuses (spec 4.4). */
+public final class AccessAccount implements Account {
+
+    public AccessAccount() {
+        return;
+    }
+
+    public #User me(String accessToken) {
+        AccessIdentity.refuse("me");
+        return null;
+    }
+
+    public void updateAttributes(String accessToken, Attributes attributes) {
+        AccessIdentity.refuse("updateAttributes");
+        return;
+    }
+
+    public void changePassword(String accessToken, String oldPassword, String newPassword) {
+        AccessIdentity.refuse("changePassword");
+        return;
+    }
+
+    public void deleteMe(String accessToken) {
+        AccessIdentity.refuse("deleteMe");
+        return;
+    }
+
+    public #TotpEnrollment enrollTotp(String accessToken) {
+        AccessIdentity.refuse("enrollTotp");
+        return null;
+    }
+
+    public void activateTotp(String accessToken, String code) {
+        AccessIdentity.refuse("activateTotp");
+        return;
+    }
+
+    public void signOutEverywhere(String accessToken) {
+        AccessIdentity.refuse("signOutEverywhere");
+        return;
+    }
+}

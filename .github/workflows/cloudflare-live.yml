@@ -46,6 +46,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y /tmp/cajeta_*_amd64.deb
 
+      # cloud 0.5.1 (the shared JwksCache, Unit 4) is not on Olla yet either.
+      - name: Checkout cajeta-cloud (sibling, until 0.5.1 is on Olla)
+        uses: actions/checkout@v4
+        with:
+          repository: jklappenbach/cajeta-cloud
+          path: .deps/cajeta-cloud
+
       - name: Checkout cajeta-cloud-s3 (sibling, until it is on Olla)
         uses: actions/checkout@v4
         with:
@@ -55,6 +62,7 @@ jobs:
       - name: Run the suite with the live legs
         timeout-minutes: 45
         env:
+          CLOUD_REPO: ${{ github.workspace }}/.deps/cajeta-cloud
           S3_REPO: ${{ github.workspace }}/.deps/cajeta-cloud-s3
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}

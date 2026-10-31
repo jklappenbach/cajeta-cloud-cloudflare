@@ -1,0 +1,74 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.identity.Claims;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.cloud.identity.ManualTimeSource;
+import dev.cajeta.cloud.cloudflare.AccessRequests;
+import dev.cajeta.cloud.cloudflare.AccessTokenVerifier;
+import dev.cajeta.http.HttpRequest;
+
+/**
+ * Reading the Access token off a request (spec 4.1; plan 4.1.6): the
+ * Cf-Access-Jwt-Assertion header, else the CF_Authorization cookie. A
+ * request with neither is unauthenticated (null), not an error; a request
+ * with a bad token is refused like any other.
+ */
+public class AccessRequestsTest {
+
+    public AccessRequestsTest() {
+        return;
+    }
+
+    @Test
+    public void theHeaderThenTheCookieThenNothing() {
+        String token #= Fixtures.read("user.jwt");
+        HttpRequest h = heap HttpRequest(16);
+        h.setHeader("Cf-Access-Jwt-Assertion", token);
+        String fromHeader #= AccessRequests.tokenOf(h);
+        Assert.equals(token, fromHeader);
+        HttpRequest c = heap HttpRequest(16);
+        c.setHeader("Cookie", "theme=dark; CF_Authorization=" + token + "; other=1");
+        String fromCookie #= AccessRequests.tokenOf(c);
+        Assert.equals(token, fromCookie);
+        HttpRequest last = heap HttpRequest(16);
+        last.setHeader("Cookie", "CF_Authorization=" + token);
+        String fromLast #= AccessRequests.tokenOf(last);
+        Assert.equals(token, fromLast);
+        HttpRequest none = heap HttpRequest(16);
+        none.setHeader("Cookie", "theme=dark");
+        String nothing #= AccessRequests.tokenOf(none);
+        Assert.isTrue(nothing == null);
+        HttpRequest bare = heap HttpRequest(16);
+        String bareNothing #= AccessRequests.tokenOf(bare);
+        Assert.isTrue(bareNothing == null);
+        return;
+    }
+
+    @Test
+    public void verifyGivesClaimsOrNullOrRefuses() {
+        FixtureJwksSource keys #= Fixtures.certs("certs.json", 3600L);
+        ManualTimeSource clock = heap ManualTimeSource(Fixtures.IAT + 60L);
+        AccessTokenVerifier v #= AccessTokenVerifierTest.verifier(keys, clock);
+        String token #= Fixtures.read("user.jwt");
+        HttpRequest h = heap HttpRequest(16);
+        h.setHeader("Cf-Access-Jwt-Assertion", token);
+        Claims c #= AccessRequests.verify(v, h);
+        Assert.equals(Fixtures.SUB, c.subject());
+        HttpRequest bare = heap HttpRequest(16);
+        Claims none #= AccessRequests.verify(v, bare);
+        Assert.isTrue(none == null);
+        String forged #= Fixtures.read("user-forged.jwt");
+        HttpRequest bad = heap HttpRequest(16);
+        bad.setHeader("Cookie", "CF_Authorization=" + forged);
+        int32 kind = -1;
+        try {
+            Claims x #= AccessRequests.verify(v, bad);
+        } catch (IdentityException e) {
+            kind = e.kind();
+        }
+        Assert.isTrue(kind == IdentityException.INVALID_TOKEN());
+        return;
+    }
+}

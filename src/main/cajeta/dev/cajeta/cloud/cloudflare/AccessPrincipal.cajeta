@@ -1,0 +1,38 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+import dev.cajeta.cloud.identity.Claims;
+
+/**
+ * Who a verified Access token speaks for (spec 4.3, 4.5): a user, with a
+ * subject and an email, or a service token, which carries `common_name`
+ * (the token's client id) and an empty subject.
+ */
+public final class AccessPrincipal {
+    String sub;
+    String mail;
+    String name;
+    boolean service;
+
+    AccessPrincipal(String subject, String email, String commonName, boolean isService) {
+        this.sub = "" + subject;
+        this.mail = "" + email;
+        this.name = "" + commonName;
+        this.service = isService;
+        return;
+    }
+
+    public static #AccessPrincipal of(Claims c) {
+        String sub #= c.subject();
+        String email #= c.claim("email");
+        String cn #= c.claim("common_name");
+        boolean isService = cn.byteLength() > 0 && sub.byteLength() == 0;
+        return heap AccessPrincipal(sub, email, cn, isService);
+    }
+
+    public String subject() { return this.sub; }
+    public String email() { return this.mail; }
+    /** The service token's client id, or "" for a user. */
+    public String commonName() { return this.name; }
+    public boolean isService() { return this.service; }
+}

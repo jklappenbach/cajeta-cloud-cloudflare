@@ -1,0 +1,156 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.codec.Base64;
+import cajeta.codec.Base64Exception;
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonArray;
+import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonParseException;
+import cajeta.codec.json.JsonValue;
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import dev.cajeta.cloud.identity.Attributes;
+import dev.cajeta.cloud.identity.Claims;
+import dev.cajeta.cloud.identity.DecodedJwt;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.cloud.identity.Jwks;
+import dev.cajeta.cloud.identity.JwksCache;
+import dev.cajeta.cloud.identity.JwksSource;
+import dev.cajeta.cloud.identity.Jwt;
+import dev.cajeta.cloud.identity.TimeSource;
+import dev.cajeta.cloud.identity.TokenUse;
+import dev.cajeta.cloud.identity.TokenVerifier;
+
+/**
+ * Verifies Cloudflare Access application tokens offline (spec 4.1, 4.3):
+ * the key by `kid` from the team's certificate set through the shared
+ * JwksCache, the RS256 signature, `iss` equal to the team domain, `aud` (an
+ * array) holding the application's AUD tag, `nbf` not after now and `exp`
+ * after now. A failure is INVALID_TOKEN naming the check, never the token.
+ * Access has one token kind, so the expected use is not a check; the
+ * claims report ACCESS. Groups are the token's `groups` array when the
+ * identity provider's groups are forwarded, else none. A service token
+ * verifies the same way; `AccessPrincipal.of` tells the two apart.
+ */
+public final class AccessTokenVerifier implements TokenVerifier {
+    String issuer;
+    String aud;
+    JwksCache cache;
+    TimeSource clock;
+
+    public AccessTokenVerifier(AccessConfig config, JwksSource source, TimeSource clock) {
+        this.issuer #= config.issuer();
+        this.aud = "" + config.aud();
+        this.cache = heap JwksCache(#source, clock);   // forwards the mode the caller gave: a title moves to the cache, a lend stays a lend
+        this.clock #= clock;
+        return;
+    }
+
+    public #Claims verify(String token, int32 expectedUse) {
+        DecodedJwt d #= Jwt.decode(token, "access", "verify");
+        d.requireAsymmetric("access", "verify");
+        String alg #= d.alg();
+        if (!alg.equals("RS256")) {
+            AccessTokenVerifier.bad("-", "algorithm");
+        }
+        String kid #= d.kid();
+        if (!this.cache.has(kid)) {
+            AccessTokenVerifier.bad("-", "key");
+        }
+        Jwks keys #= this.cache.keys();
+        if (!d.verifiedBy(keys)) {
+            AccessTokenVerifier.bad("-", "signature");
+        }
+        Claims c #= d.claims();
+        String sub #= c.subject();
+        String iss #= c.issuer();
+        if (!iss.equals(this.issuer)) {
+            AccessTokenVerifier.bad(sub, "issuer");
+        }
+        int64 now = this.clock.nowSeconds();
+        if (c.has("nbf")) {
+            String nbf #= c.claim("nbf");
+            if (AccessTokenVerifier.number(nbf) > now) {
+                AccessTokenVerifier.bad(sub, "not-before");
+            }
+        }
+        if (c.expiresAt() <= now) {
+            AccessTokenVerifier.bad(sub, "expiry");
+        }
+        return this.withAudience(c, token, sub);
+    }
+
+    public #Jwks jwks() {
+        return this.cache.keys();
+    }
+
+    private static void bad(String subject, String check) {
+        throw heap IdentityException(IdentityException.INVALID_TOKEN(), "access",
+            "verify", subject, "token failed the " + check + " check");
+    }
+
+    private static int64 number(String s) {
+        int64 v = 0L;
+        for (int32 i = 0; i < s.byteLength(); i++) {
+            int8 c = s.byteAt(i);
+            if (c < (int8) 48 || c > (int8) 57) break;
+            v = v * 10L + (int64) (c - (int8) 48);
+        }
+        return v;
+    }
+
+    // Checks the `aud` array against the tag (the port's claims keep only
+    // scalar values, so the array is read from the payload here) and returns
+    // the claims with `aud` set to the tag. The token has already verified,
+    // so its payload parses.
+    private #Claims withAudience(Claims c, String token, String sub) {
+        Attributes all = heap Attributes();
+        ArrayList<String> groups = heap ArrayList<String>();
+        boolean audHeld = false;
+        int64 a = token.indexOf(".");
+        int64 b = token.indexOfFrom(".", a + 1L);
+        String seg #= token.substring((int32) (a + 1L), (int32) b);
+        try {
+            int8[] payload #= Base64.decode(seg);
+            JsonValue root #= Json.parse(payload, payload.count());
+            JsonObject o = root.object();
+            for (int32 i = 0; i < o.count(); i++) {
+                int32 kl = o.keyLenAt(i);
+                int8[] kb = heap int8[kl < 1 ? 1 : kl];
+                int8[] raw = o.keyAt(i);
+                for (int32 j = 0; j < kl; j++) kb[j] = raw[j];
+                String name = heap String(#kb, kl);
+                if (c.has(name)) {
+                    String value #= c.claim(name);
+                    all.set(name, value);
+                }
+            }
+            JsonValue audValue = o.get("aud");
+            if (audValue != null && audValue.kind() == JsonValue.ARRAY) {
+                JsonArray arr = audValue.array();
+                for (int32 i = 0; i < arr.count(); i++) {
+                    JsonValue av = arr.get(i);
+                    if (av.kind() != JsonValue.STRING) continue;
+                    String tag #= av.asString();
+                    if (tag.equals(this.aud)) audHeld = true;
+                }
+            } else if (audValue != null && audValue.kind() == JsonValue.STRING) {
+                String tag #= audValue.asString();
+                audHeld = tag.equals(this.aud);
+            }
+            for (int32 i = 0; i < c.groupCount(); i++) {
+                String g #= c.groupAt(i);
+                groups.add(#g);
+            }
+        } catch (Base64Exception e) {
+            AccessTokenVerifier.bad("-", "structure");
+        } catch (JsonParseException e) {
+            AccessTokenVerifier.bad("-", "structure");
+        }
+        if (!audHeld) {
+            AccessTokenVerifier.bad(sub, "audience");
+        }
+        all.set("aud", this.aud);
+        return heap Claims(#all, #groups, TokenUse.ACCESS(), c.expiresAt(), c.issuedAt());
+    }
+}

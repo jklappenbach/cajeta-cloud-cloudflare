@@ -1,0 +1,62 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.cloudflare.AccessConfig;
+import dev.cajeta.cloud.cloudflare.CloudflareConfigurationException;
+
+/**
+ * Access configuration (spec 7.3): the team domain and the application's AUD
+ * tag, from an AccessConfig component else CLOUDFLARE_ACCESS_TEAM and
+ * CLOUDFLARE_ACCESS_AUD; no secret. A missing value names the variable.
+ */
+public class AccessConfigTest {
+
+    public AccessConfigTest() {
+        return;
+    }
+
+    @Test
+    public void theComponentWinsAndTheEnvironmentFills() {
+        System.env.set("CLOUDFLARE_ACCESS_TEAM", "env-team");
+        System.env.set("CLOUDFLARE_ACCESS_AUD", "envaud");
+        AccessConfig c = heap AccessConfig("cfg-team", "cfgaud");
+        AccessConfig r #= AccessConfig.resolve(c);
+        String iss #= r.issuer();
+        Assert.equals("https://cfg-team.cloudflareaccess.com", iss);
+        Assert.equals("cfgaud", r.aud());
+        AccessConfig e #= AccessConfig.resolve(null);
+        String eiss #= e.issuer();
+        Assert.equals("https://env-team.cloudflareaccess.com", eiss);
+        Assert.equals("envaud", e.aud());
+        AccessConfig half = heap AccessConfig("cfg-team", null);
+        AccessConfig h #= AccessConfig.resolve(half);
+        Assert.equals("envaud", h.aud());
+        System.env.set("CLOUDFLARE_ACCESS_TEAM", "");
+        System.env.set("CLOUDFLARE_ACCESS_AUD", "");
+        return;
+    }
+
+    @Test
+    public void aMissingValueNamesTheVariable() {
+        System.env.set("CLOUDFLARE_ACCESS_TEAM", "");
+        System.env.set("CLOUDFLARE_ACCESS_AUD", "");
+        String message = "";
+        try {
+            AccessConfig r #= AccessConfig.resolve(null);
+        } catch (CloudflareConfigurationException e) {
+            message = "" + e.message;
+        }
+        Assert.isTrue(message.indexOf("CLOUDFLARE_ACCESS_TEAM") >= 0L);
+        System.env.set("CLOUDFLARE_ACCESS_TEAM", "env-team");
+        message = "";
+        try {
+            AccessConfig r #= AccessConfig.resolve(null);
+        } catch (CloudflareConfigurationException e) {
+            message = "" + e.message;
+        }
+        Assert.isTrue(message.indexOf("CLOUDFLARE_ACCESS_AUD") >= 0L);
+        System.env.set("CLOUDFLARE_ACCESS_TEAM", "");
+        return;
+    }
+}

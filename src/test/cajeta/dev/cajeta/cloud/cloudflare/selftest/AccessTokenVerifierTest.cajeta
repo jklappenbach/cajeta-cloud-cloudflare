@@ -1,0 +1,166 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.identity.Claims;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.cloud.identity.Jwks;
+import dev.cajeta.cloud.identity.ManualTimeSource;
+import dev.cajeta.cloud.identity.TokenUse;
+import dev.cajeta.cloud.cloudflare.AccessConfig;
+import dev.cajeta.cloud.cloudflare.AccessPrincipal;
+import dev.cajeta.cloud.cloudflare.AccessTokenVerifier;
+
+/**
+ * Verifying Access application tokens (spec 4.1, 4.3, 4.5; plan 4.1.1,
+ * 4.1.2, 4.1.4): RS256 against the team's certificate set, `iss` the team
+ * domain, `aud` (an array) holding the application's AUD tag, `exp` and
+ * `nbf` against the clock. Each failed check is INVALID_TOKEN naming the
+ * check and never the token. A verified token's claims carry the subject,
+ * the email and the forwarded groups; a service token's principal says it is
+ * a service. Fixtures from generate.py in src/test/resources/access: issued
+ * at 1767225600, a day's life.
+ */
+public class AccessTokenVerifierTest {
+
+    public AccessTokenVerifierTest() {
+        return;
+    }
+
+    @Test
+    public void aUserTokenVerifiesWithItsClaimsAndGroups() {
+        FixtureJwksSource keys #= Fixtures.certs("certs.json", 3600L);
+        ManualTimeSource clock = heap ManualTimeSource(Fixtures.IAT + 60L);
+        AccessTokenVerifier v #= AccessTokenVerifierTest.verifier(keys, clock);
+        String token #= Fixtures.read("user.jwt");
+        Claims c #= v.verify(token, TokenUse.ACCESS());
+        Assert.equals(Fixtures.SUB, c.subject());
+        Assert.equals("ada@example.com", c.claim("email"));
+        Assert.equals("https://example-team.cloudflareaccess.com", c.issuer());
+        Assert.equals(Fixtures.AUD, c.audience());
+        Assert.equals("GB", c.claim("country"));
+        Assert.isTrue(c.expiresAt() == Fixtures.EXP);
+        Assert.isTrue(c.issuedAt() == Fixtures.IAT);
+        Assert.isTrue(c.groupCount() == 2);
+        Assert.isTrue(c.inGroup("admins"));
+        Assert.isTrue(c.inGroup("editors"));
+        Assert.isTrue(keys.fetches() == 1);
+        AccessPrincipal p #= AccessPrincipal.of(c);
+        Assert.isFalse(p.isService());
+        Assert.equals("ada@example.com", p.email());
+        Assert.equals(Fixtures.SUB, p.subject());
+        // Access has one token kind: the expected use is not a check.
+        Claims again #= v.verify(token, TokenUse.ID());
+        Assert.equals(Fixtures.SUB, again.subject());
+        // The second key in the set signs too; a token without groups has none.
+        String second #= Fixtures.read("user-second-key.jwt");
+        Claims c2 #= v.verify(second, TokenUse.ACCESS());
+        Assert.equals(Fixtures.SUB, c2.subject());
+        String bare #= Fixtures.read("user-no-groups.jwt");
+        Claims c3 #= v.verify(bare, TokenUse.ACCESS());
+        Assert.isTrue(c3.groupCount() == 0);
+        Assert.isTrue(keys.fetches() == 1);
+        return;
+    }
+
+    @Test
+    public void aServiceTokenVerifiesAsAService() {
+        FixtureJwksSource keys #= Fixtures.certs("certs.json", 3600L);
+        ManualTimeSource clock = heap ManualTimeSource(Fixtures.IAT + 60L);
+        AccessTokenVerifier v #= AccessTokenVerifierTest.verifier(keys, clock);
+        String token #= Fixtures.read("service.jwt");
+        Claims c #= v.verify(token, TokenUse.ACCESS());
+        AccessPrincipal p #= AccessPrincipal.of(c);
+        Assert.isTrue(p.isService());
+        Assert.equals("3a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d.access", p.commonName());
+        Assert.equals("", p.email());
+        Assert.equals("", p.subject());
+        return;
+    }
+
+    @Test
+    public void eachFailedCheckIsNamedAndNeverTheToken() {
+        FixtureJwksSource keys #= Fixtures.certs("certs.json", 3600L);
+        ManualTimeSource clock = heap ManualTimeSource(Fixtures.IAT + 60L);
+        AccessTokenVerifier v #= AccessTokenVerifierTest.verifier(keys, clock);
+        AccessTokenVerifierTest.refused(v, "user-wrong-issuer.jwt", "issuer");
+        AccessTokenVerifierTest.refused(v, "user-wrong-aud.jwt", "audience");
+        AccessTokenVerifierTest.refused(v, "user-not-yet-valid.jwt", "not-before");
+        AccessTokenVerifierTest.refused(v, "user-forged.jwt", "signature");
+        clock.set(Fixtures.EXP);
+        AccessTokenVerifierTest.refused(v, "user.jwt", "expiry");
+        clock.set(Fixtures.IAT + 60L);
+        // An aud array with the tag anywhere in it passes.
+        String two #= Fixtures.read("user-two-auds.jwt");
+        Claims c #= v.verify(two, TokenUse.ACCESS());
+        Assert.equals(Fixtures.SUB, c.subject());
+        return;
+    }
+
+    @Test
+    public void anUnknownKidRefetchesOnceThenRefuses() {
+        FixtureJwksSource keys #= Fixtures.certs("certs.json", 3600L);
+        ManualTimeSource clock = heap ManualTimeSource(Fixtures.IAT + 60L);
+        AccessTokenVerifier v #= AccessTokenVerifierTest.verifier(keys, clock);
+        AccessTokenVerifierTest.refused(v, "user-rotated-key.jwt", "key");
+        Assert.isTrue(keys.fetches() == 2);
+        AccessTokenVerifierTest.refused(v, "user-rotated-key.jwt", "key");
+        Assert.isTrue(keys.fetches() == 2);
+        // A rotated set found by the refetch verifies the new key.
+        FixtureJwksSource rotating #= Fixtures.certs("certs.json", 3600L);
+        String rotated #= Fixtures.read("certs-rotated.json");
+        rotating.then(rotated);
+        AccessTokenVerifier v2 #= AccessTokenVerifierTest.verifier(rotating, clock);
+        String token #= Fixtures.read("user-rotated-key.jwt");
+        Claims c #= v2.verify(token, TokenUse.ACCESS());
+        Assert.equals(Fixtures.SUB, c.subject());
+        Assert.isTrue(rotating.fetches() == 2);
+        Jwks doc #= v2.jwks();
+        String json #= doc.json();
+        Assert.isTrue(json.indexOf("rotated-kid-3") >= 0L);
+        return;
+    }
+
+    @Test
+    public void theIssuerAndCertsUrlFollowTheTeamDomain() {
+        AccessConfig a = heap AccessConfig("example-team", Fixtures.AUD);
+        String iss #= a.issuer();
+        Assert.equals("https://example-team.cloudflareaccess.com", iss);
+        String url #= a.certsUrl();
+        Assert.equals("https://example-team.cloudflareaccess.com/cdn-cgi/access/certs", url);
+        // The team may be given as its full domain or URL.
+        AccessConfig b = heap AccessConfig("example-team.cloudflareaccess.com", Fixtures.AUD);
+        String iss2 #= b.issuer();
+        Assert.equals("https://example-team.cloudflareaccess.com", iss2);
+        AccessConfig c = heap AccessConfig("https://example-team.cloudflareaccess.com/", Fixtures.AUD);
+        String iss3 #= c.issuer();
+        Assert.equals("https://example-team.cloudflareaccess.com", iss3);
+        return;
+    }
+
+    static #AccessTokenVerifier verifier(FixtureJwksSource keys, ManualTimeSource clock) {
+        AccessConfig a = heap AccessConfig(Fixtures.TEAM, Fixtures.AUD);
+        return heap AccessTokenVerifier(a, keys, clock);
+    }
+
+    // Fails unless verifying `file` is refused as INVALID_TOKEN naming `check`.
+    static void refused(AccessTokenVerifier v, String file, String check) {
+        String token #= Fixtures.read(file);
+        try {
+            Claims c #= v.verify(token, TokenUse.ACCESS());
+        } catch (IdentityException e) {
+            Assert.isTrue(e.kind() == IdentityException.INVALID_TOKEN());
+            if (e.message.indexOf(check) < 0L) {
+                Assert.fail(file + ": refused, but not by the " + check + " check: " + e.message);
+            }
+            // Never the token: its signature segment is not in the message.
+            int64 dot = token.indexOf(".");
+            int64 dot2 = token.indexOfFrom(".", dot + 1L);
+            String sig #= token.substring((int32) (dot2 + 1L), token.byteLength());
+            Assert.isTrue(e.message.indexOf(sig) < 0L);
+            return;
+        }
+        Assert.fail(file + " verified; expected the " + check + " check to refuse it");
+        return;
+    }
+}

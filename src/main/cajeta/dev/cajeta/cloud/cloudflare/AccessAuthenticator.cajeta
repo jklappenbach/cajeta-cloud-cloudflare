@@ -1,0 +1,56 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+import dev.cajeta.cloud.identity.Authenticator;
+import dev.cajeta.cloud.identity.ChallengeAnswer;
+import dev.cajeta.cloud.identity.SignInResult;
+import dev.cajeta.cloud.identity.Tokens;
+import dev.cajeta.cloud.identity.TotpEnrollment;
+
+/** The Access adapter's authenticator: every operation refuses (spec 4.4); Access signs users in itself. */
+public final class AccessAuthenticator implements Authenticator {
+
+    public AccessAuthenticator() {
+        return;
+    }
+
+    public #SignInResult signIn(String username, String password) {
+        AccessIdentity.refuse("signIn");
+        return null;
+    }
+
+    public #SignInResult signInWith(String username, int32 factor) {
+        AccessIdentity.refuse("signInWith");
+        return null;
+    }
+
+    public #SignInResult respond(String session, int32 kind, ChallengeAnswer answer) {
+        AccessIdentity.refuse("respond");
+        return null;
+    }
+
+    public #Tokens refresh(String refreshToken) {
+        AccessIdentity.refuse("refresh");
+        return null;
+    }
+
+    public void signOut(String refreshToken) {
+        AccessIdentity.refuse("signOut");
+        return;
+    }
+
+    public void forgotPassword(String username) {
+        AccessIdentity.refuse("forgotPassword");
+        return;
+    }
+
+    public void confirmForgotPassword(String username, String code, String newPassword) {
+        AccessIdentity.refuse("confirmForgotPassword");
+        return;
+    }
+
+    public #TotpEnrollment enrollTotpForChallenge(String session) {
+        AccessIdentity.refuse("enrollTotpForChallenge");
+        return null;
+    }
+}

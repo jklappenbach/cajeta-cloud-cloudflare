@@ -1,0 +1,107 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.Capabilities;
+import dev.cajeta.cloud.identity.Attributes;
+import dev.cajeta.cloud.identity.Claims;
+import dev.cajeta.cloud.identity.IdentityCapability;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.cloud.identity.ManualTimeSource;
+import dev.cajeta.cloud.identity.RegistrationResult;
+import dev.cajeta.cloud.identity.SignInResult;
+import dev.cajeta.cloud.identity.TokenUse;
+import dev.cajeta.cloud.identity.Tokens;
+import dev.cajeta.cloud.identity.TotpEnrollment;
+import dev.cajeta.cloud.identity.User;
+import dev.cajeta.cloud.cloudflare.AccessConfig;
+import dev.cajeta.cloud.cloudflare.AccessIdentity;
+
+/**
+ * The Access adapter behind the identity port (spec 4.4, 4.6; plan 4.1.5):
+ * it verifies tokens and nothing else. Its capabilities declare JWKS and
+ * nothing else; every UserPool, Authenticator and Account operation refuses
+ * as UNSUPPORTED_CAPABILITY naming the adapter and the operation, before any
+ * request; the verifier is the real one.
+ */
+public class AccessIdentityTest {
+
+    public AccessIdentityTest() {
+        return;
+    }
+
+    @Test
+    public void capabilitiesDeclareTokenVerificationOnly() {
+        AccessIdentity id #= AccessIdentityTest.identity();
+        Capabilities c = id.capabilities();
+        String name #= c.adapterName();
+        Assert.equals("access", name);
+        Assert.isTrue(c.supports(IdentityCapability.JWKS()));
+        Assert.isFalse(c.supports(IdentityCapability.CONFIRMATION()));
+        Assert.isFalse(c.supports(IdentityCapability.REFRESH()));
+        Assert.isFalse(c.supports(IdentityCapability.TOTP()));
+        Assert.isFalse(c.supports(IdentityCapability.GROUPS()));
+        Assert.isFalse(c.supports(IdentityCapability.ADMIN()));
+        Assert.isFalse(c.supports(IdentityCapability.PASSWORD_RESET()));
+        return;
+    }
+
+    @Test
+    public void theVerifierIsTheRealOne() {
+        AccessIdentity id #= AccessIdentityTest.identity();
+        String token #= Fixtures.read("user.jwt");
+        Claims c #= id.verifier().verify(token, TokenUse.ACCESS());
+        Assert.equals(Fixtures.SUB, c.subject());
+        return;
+    }
+
+    @Test
+    public void everyOtherOperationRefusesByName() {
+        AccessIdentity id #= AccessIdentityTest.identity();
+        int32 refused = 0;
+        try { RegistrationResult r #= id.register("ada", "pw"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "register"); }
+        try { RegistrationResult r #= id.registerWith("ada", "pw", heap Attributes()); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "registerWith"); }
+        try { RegistrationResult r #= id.registerPasswordless("ada", heap Attributes()); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "registerPasswordless"); }
+        try { id.confirm("ada", "123456"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "confirm"); }
+        try { User u #= id.lookupBySubject("s"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "lookupBySubject"); }
+        try { User u #= id.lookupByName("ada"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "lookupByName"); }
+        try { boolean d = id.delete("s"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "delete"); }
+        try { id.setAttribute("s", "a", "b"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "setAttribute"); }
+        try { id.removeAttribute("s", "a"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "removeAttribute"); }
+        try { id.addToGroup("s", "g"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "addToGroup"); }
+        try { id.removeFromGroup("s", "g"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "removeFromGroup"); }
+        try { String[] g #= id.groups("s"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "groups"); }
+        try { SignInResult r #= id.authenticator().signIn("ada", "pw"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "signIn"); }
+        try { SignInResult r #= id.authenticator().signInWith("ada", 0); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "signInWith"); }
+        try { Tokens t #= id.authenticator().refresh("r"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "refresh"); }
+        try { id.authenticator().signOut("r"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "signOut"); }
+        try { id.authenticator().forgotPassword("ada"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "forgotPassword"); }
+        try { id.authenticator().confirmForgotPassword("ada", "c", "pw"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "confirmForgotPassword"); }
+        try { TotpEnrollment t #= id.authenticator().enrollTotpForChallenge("s"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "enrollTotpForChallenge"); }
+        try { User u #= id.account().me("t"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "me"); }
+        try { id.account().updateAttributes("t", heap Attributes()); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "updateAttributes"); }
+        try { id.account().changePassword("t", "a", "b"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "changePassword"); }
+        try { id.account().deleteMe("t"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "deleteMe"); }
+        try { TotpEnrollment t #= id.account().enrollTotp("t"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "enrollTotp"); }
+        try { id.account().activateTotp("t", "c"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "activateTotp"); }
+        try { id.account().signOutEverywhere("t"); } catch (IdentityException e) { refused = refused + AccessIdentityTest.unsupported(e, "signOutEverywhere"); }
+        Assert.isTrue(refused == 26);
+        return;
+    }
+
+    static int32 unsupported(IdentityException e, String operation) {
+        Assert.isTrue(e.kind() == IdentityException.UNSUPPORTED_CAPABILITY());
+        String p #= e.provider();
+        Assert.equals("access", p);
+        String op #= e.operation();
+        Assert.equals(operation, op);
+        return 1;
+    }
+
+    static #AccessIdentity identity() {
+        FixtureJwksSource keys #= Fixtures.certs("certs.json", 3600L);
+        ManualTimeSource clock = heap ManualTimeSource(Fixtures.IAT + 60L);
+        AccessConfig a = heap AccessConfig(Fixtures.TEAM, Fixtures.AUD);
+        return AccessIdentity.over(a, #keys, #clock);
+    }
+}

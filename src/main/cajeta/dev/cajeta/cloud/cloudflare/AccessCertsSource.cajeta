@@ -1,0 +1,49 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.error.RecoverableException;
+import cajeta.lang.String;
+import dev.cajeta.cloud.identity.IdentityException;
+import dev.cajeta.cloud.identity.JwksDocument;
+import dev.cajeta.cloud.identity.JwksSource;
+import dev.cajeta.http.ClientResponse;
+import dev.cajeta.http.client.HttpClient;
+
+/**
+ * Fetches a team's certificate set, `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`
+ * (spec 4.2), whose `keys` is a JWKS, with the lifetime its Cache-Control
+ * grants. The shared JwksCache decides when. A failed fetch is TRANSIENT when
+ * it may pass on a retry (no connection, a 5xx) and PROVIDER_ERROR otherwise.
+ */
+public final class AccessCertsSource implements JwksSource {
+    String url;
+    HttpClient client;
+
+    public AccessCertsSource(String url) {
+        this.url = "" + url;
+        this.client = heap HttpClient();
+        return;
+    }
+
+    public #JwksDocument fetch() {
+        ClientResponse r = null;
+        try {
+            r #= this.client.get(this.url);
+        } catch (RecoverableException e) {
+            throw heap IdentityException(IdentityException.TRANSIENT(), "access",
+                "certs", this.url, "fetching the certificate set failed: " + e.message);
+        }
+        int32 status = r.status();
+        if (status >= 500) {
+            throw heap IdentityException(IdentityException.TRANSIENT(), "access",
+                "certs", this.url, "the certificate set answered HTTP " + status);
+        }
+        if (!r.isSuccess()) {
+            throw heap IdentityException(IdentityException.PROVIDER_ERROR(), "access",
+                "certs", this.url, "the certificate set answered HTTP " + status
+                + "; check the team domain");
+        }
+        String body #= r.bodyString();
+        String cc #= r.headerString("Cache-Control");
+        return heap JwksDocument(body, JwksDocument.maxAgeOf(cc));
+    }
+}
