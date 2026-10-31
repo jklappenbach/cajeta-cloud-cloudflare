@@ -57,6 +57,18 @@ Cloudflare's 60-second bound and no conditional writes, refuses KV's limits
 by name and retries a rate limit. It reads `CLOUDFLARE_KV_NAMESPACE_ID` and
 the kv token of the chain. The skill `cloudflare-workers-kv` covers it.
 
+## Capabilities
+
+What each adapter declares (parent spec §3.5); an undeclared capability's
+operation refuses by name before any request.
+
+| Adapter | Declared | Not declared |
+|---|---|---|
+| `r2` object store | `object.multipart` (equal parts but the last, 5 MiB at least), `object.range-read`, `object.list-lexicographic`, `object.read-after-write`, `object.server-side-copy`; `object.conditional-put-create` and `-overwrite` with `R2_CONDITIONAL_WRITES=1` | the conditional puts until spec Q1 is verified |
+| `access` identity | `identity.jwks` | everything else: registration, sign-in, passwords, factors, groups, admin |
+| `cloudflare` queue | `queue.delayed-send` (up to 12 h), `queue.dead-letter-reporting` (the attempt count) | `queue.fifo`, `queue.exactly-once`, `queue.message-groups` |
+| `cloudflare` key-value | `kv.metadata` (JSON, 1024 B), `kv.expiry` (absolute, or a TTL of 60 s or more); eventual with a 60 s `propagationBoundSeconds()` | `kv.conditional-create`, `kv.compare-and-set`, `kv.strong-consistency`, `kv.read-your-writes` |
+
 **Status: in development (0.1.0 unreleased).** The spec and plan are
 `cajeta-cloud-cloudflare` in the cajeta repository's `specs/` and `agents/`.
 
