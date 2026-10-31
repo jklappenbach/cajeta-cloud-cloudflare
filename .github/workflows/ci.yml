@@ -113,29 +113,21 @@ jobs:
       # Until its 0.1.0 is on Olla, a sibling checkout builds it: run-tests.sh
       # takes S3_REPO, and `cajeta install` seeds the runner's store so the
       # release build below resolves the pin. Drop both once 0.1.0 is published.
-      # cloud 0.5.1 (the shared JwksCache, Unit 4) is not on Olla yet either.
-      - name: Checkout cajeta-cloud (sibling, until 0.5.1 is on Olla)
-        uses: actions/checkout@v4
-        with:
-          repository: jklappenbach/cajeta-cloud
-          path: .deps/cajeta-cloud
-
       - name: Checkout cajeta-cloud-s3 (sibling, until it is on Olla)
         uses: actions/checkout@v4
         with:
           repository: jklappenbach/cajeta-cloud-s3
           path: .deps/cajeta-cloud-s3
 
-      - name: Install cajeta-cloud and cajeta-cloud-s3 into the local store
+      - name: Install cajeta-cloud-s3 into the local store
         run: |
           set -euo pipefail
-          ( cd .deps/cajeta-cloud && cajeta install )
-          ( cd .deps/cajeta-cloud-s3 && cajeta install )
+          cd .deps/cajeta-cloud-s3
+          cajeta install
 
       - name: Run the test suite
         timeout-minutes: 30
         env:
-          CLOUD_REPO: ${{ github.workspace }}/.deps/cajeta-cloud
           S3_REPO: ${{ github.workspace }}/.deps/cajeta-cloud-s3
         run: ./run-tests.sh
 
