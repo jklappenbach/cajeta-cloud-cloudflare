@@ -1,0 +1,13 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+
+/**
+ * Carries one Cloudflare Queues REST call: a POST to `messages`,
+ * `messages/batch`, `messages/pull` or `messages/ack` under the queue, with
+ * a JSON body. [[HttpQueuesApi]] sends it with the API token; the testkit's
+ * FakeQueuesApi answers in process.
+ */
+public interface QueuesApi {
+    #QueuesReply call(String operation, String jsonBody);
+}

@@ -1,0 +1,330 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.codec.Base64;
+import cajeta.codec.Base64Exception;
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonArray;
+import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonParseException;
+import cajeta.codec.json.JsonValue;
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import cajeta.lang.StringBuilder;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.cloud.queue.Message;
+import dev.cajeta.cloud.queue.MessageAttributes;
+
+/**
+ * The JSON of the Queues REST API, and the port's message envelope. Queues
+ * carries a body and a content type but no attributes, so a message is sent
+ * as JSON, `{"attributes":{...},"body":"<base64>"}`, and read back from it; a
+ * Worker consuming the same queue reads `message.body.attributes` and
+ * decodes `message.body.body`.
+ */
+public final class QueuesJson {
+
+    /** `{"body":<envelope>,"content_type":"json","delay_seconds":n}`; the delay only when set. */
+    public static #String sendBody(int8[] body, MessageAttributes attributes, int64 delaySeconds) {
+        StringBuilder sb = heap StringBuilder();
+        sb.append("{\"body\":");
+        String env #= QueuesJson.envelope(body, attributes);
+        sb.append(env);
+        sb.append(",\"content_type\":\"json\"");
+        if (delaySeconds > 0L) {
+            sb.append(",\"delay_seconds\":");
+            sb.append("" + delaySeconds);
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
+    /** `{"messages":[<sendBody>...]}`. */
+    public static #String batchBody(ArrayList<String> sendBodies) {
+        StringBuilder sb = heap StringBuilder();
+        sb.append("{\"messages\":[");
+        for (int32 i = 0; i < sendBodies.count(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append(sendBodies.get(i));
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    public static #String pullBody(int32 max, int64 visibilitySeconds) {
+        return "{\"batch_size\":" + max + ",\"visibility_timeout_ms\":" + (visibilitySeconds * 1000L) + "}";
+    }
+
+    /** `{"acks":[{"lease_id":..}],"retries":[{"lease_id":..,"delay_seconds":n}]}`. */
+    public static #String ackBody(ArrayList<String> acks, ArrayList<String> retries, int64 retryDelay) {
+        StringBuilder sb = heap StringBuilder();
+        sb.append("{\"acks\":[");
+        for (int32 i = 0; i < acks.count(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append("{\"lease_id\":");
+            String q #= QueuesJson.quote(acks.get(i));
+            sb.append(q);
+            sb.append("}");
+        }
+        sb.append("],\"retries\":[");
+        for (int32 i = 0; i < retries.count(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append("{\"lease_id\":");
+            String q #= QueuesJson.quote(retries.get(i));
+            sb.append(q);
+            if (retryDelay > 0L) {
+                sb.append(",\"delay_seconds\":");
+                sb.append("" + retryDelay);
+            }
+            sb.append("}");
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    // The envelope as a JSON object literal.
+    static #String envelope(int8[] body, MessageAttributes attributes) {
+        StringBuilder sb = heap StringBuilder();
+        sb.append("{\"attributes\":{");
+        if (attributes != null) {
+            for (int32 i = 0; i < attributes.count(); i++) {
+                if (i > 0) sb.append(",");
+                String n #= QueuesJson.quote(attributes.nameAt(i));
+                sb.append(n);
+                sb.append(":");
+                String v #= QueuesJson.quote(attributes.valueAt(i));
+                sb.append(v);
+            }
+        }
+        sb.append("},\"body\":\"");
+        String b64 #= Base64.encode(body, (int64) body.count());
+        sb.append(b64);
+        sb.append("\"}");
+        return sb.toString();
+    }
+
+    /** The ids a send or batch send answered: `result.id` or `result.messages[].id`. */
+    public static #ArrayList<String> idsOf(JsonValue result) {
+        ArrayList<String> ids = heap ArrayList<String>();
+        if (result.kind() == JsonValue.OBJECT) {
+            JsonObject o = result.object();
+            JsonValue one = o.get("id");
+            JsonValue many = o.get("messages");
+            if (one != null && one.kind() == JsonValue.STRING) {
+                String s #= QueuesJson.text(one);
+                ids.add(#s);
+            } else if (many != null && many.kind() == JsonValue.ARRAY) {
+                JsonArray arr = many.array();
+                for (int32 i = 0; i < arr.count(); i++) {
+                    JsonValue m = arr.get(i);
+                    if (m.kind() != JsonValue.OBJECT) continue;
+                    JsonValue id = m.object().get("id");
+                    if (id != null && id.kind() == JsonValue.STRING) {
+                        String s #= QueuesJson.text(id);
+                        ids.add(#s);
+                    }
+                }
+            }
+        }
+        return #ids;
+    }
+
+    /** The messages of a pull result, each decoded from the envelope. */
+    public static #ArrayList<Message> messagesOf(JsonValue result) {
+        ArrayList<Message> out = heap ArrayList<Message>();
+        JsonValue many = null;
+        if (result.kind() == JsonValue.OBJECT) many = result.object().get("messages");
+        if (many != null && many.kind() == JsonValue.ARRAY) {
+            JsonArray arr = many.array();
+            for (int32 i = 0; i < arr.count(); i++) {
+                JsonValue m = arr.get(i);
+                if (m.kind() != JsonValue.OBJECT) continue;
+                JsonObject mo = m.object();
+                String id #= QueuesJson.textOf(mo, "id");
+                String lease #= QueuesJson.textOf(mo, "lease_id");
+                int32 attempts = (int32) QueuesJson.numberOf(mo, "attempts");
+                int64 ts = QueuesJson.numberOf(mo, "timestamp_ms") / 1000L;
+                // The API returns the body as a string; a JSON value is taken as its text.
+                JsonValue bv = mo.get("body");
+                String raw #= "" + "";
+                if (bv != null && bv.kind() == JsonValue.STRING) raw #= QueuesJson.text(bv);
+                else if (bv != null) raw #= QueuesJson.stringify(bv);
+                MessageAttributes attrs = heap MessageAttributes();
+                int8[] body #= QueuesJson.openEnvelope(raw, attrs);
+                out.add(heap Message(#body, #attrs, id, lease, attempts, ts));
+            }
+        }
+        return #out;
+    }
+
+    // Decodes the envelope; a body that is not one is taken as-is (a
+    // producer outside this port sent it).
+    static #int8[] openEnvelope(String raw, MessageAttributes attrs) {
+        try {
+            JsonValue root #= Json.parse(raw);
+            if (root.kind() == JsonValue.OBJECT) {
+                JsonObject o = root.object();
+                JsonValue a = o.get("attributes");
+                JsonValue b = o.get("body");
+                if (b != null && b.kind() == JsonValue.STRING) {
+                    if (a != null && a.kind() == JsonValue.OBJECT) {
+                        JsonObject ao = a.object();
+                        for (int32 i = 0; i < ao.count(); i++) {
+                            String name #= QueuesJson.unescape(ao.keyAt(i), ao.keyLenAt(i));
+                            JsonValue v = ao.valueAt(i);
+                            if (v.kind() != JsonValue.STRING) continue;
+                            String value #= QueuesJson.text(v);
+                            attrs.add(name, value);
+                        }
+                    }
+                    String b64 #= QueuesJson.text(b);
+                    return Base64.decode(b64);
+                }
+            }
+        } catch (JsonParseException e) {
+            // not an envelope
+        } catch (Base64Exception e) {
+            // not an envelope
+        }
+        return raw.toBytes();
+    }
+
+    /** The `result` of a successful reply, or the error reply's (status, code, message) through QueuesErrors. */
+    public static #JsonValue resultOf(QueuesReply r, String operation) {
+        String body = r.body();
+        JsonValue root = null;
+        try {
+            root #= Json.parse(body);
+        } catch (JsonParseException e) {
+            throw QueuesErrors.of(r.status(), 0, "the Queues API answered HTTP " + r.status()
+                + " with a body that is not JSON", operation);
+        }
+        boolean success = false;
+        int32 code = 0;
+        String message #= "" + "";
+        if (root.kind() == JsonValue.OBJECT) {
+            JsonObject o = root.object();
+            JsonValue s = o.get("success");
+            success = s != null && s.kind() == JsonValue.BOOLEAN && s.asBoolean();
+            JsonValue errs = o.get("errors");
+            if (errs != null && errs.kind() == JsonValue.ARRAY && errs.array().count() > 0) {
+                JsonValue first = errs.array().get(0);
+                if (first.kind() == JsonValue.OBJECT) {
+                    code = (int32) QueuesJson.numberOf(first.object(), "code");
+                    message #= QueuesJson.textOf(first.object(), "message");
+                }
+            }
+        }
+        if (r.status() >= 200 && r.status() < 300 && success) {
+            JsonValue res = root.object().get("result");
+            if (res == null) return heap JsonValue();
+            return QueuesJson.reparse(res);
+        }
+        if (message.byteLength() == 0) message #= "the Queues API answered HTTP " + r.status();
+        throw QueuesErrors.of(r.status(), code, message, operation);
+    }
+
+    /** `result.ackCount` and `result.retryCount` of an ack reply. */
+    public static int64 countOf(JsonValue result, String name) {
+        if (result.kind() != JsonValue.OBJECT) return 0L;
+        return QueuesJson.numberOf(result.object(), name);
+    }
+
+    // A value re-parsed from its own text, so it outlives the reply's document.
+    static #JsonValue reparse(JsonValue v) {
+        String text #= QueuesJson.stringify(v);
+        return Json.parse(text);
+    }
+
+    /** `v` as JSON text. */
+    public static #String stringify(JsonValue v) {
+        int8[] b #= Json.toBytes(v);
+        int32 n = (int32) b.count();
+        return heap String(#b, n);
+    }
+
+    static #String textOf(JsonObject o, String name) {
+        JsonValue v = o.get(name);
+        if (v == null || v.kind() != JsonValue.STRING) return "" + "";
+        return QueuesJson.text(v);
+    }
+
+    static int64 numberOf(JsonObject o, String name) {
+        JsonValue v = o.get(name);
+        if (v == null || v.kind() != JsonValue.NUMBER) return 0L;
+        return v.asInt64();
+    }
+
+    static #String text(JsonValue v) {
+        return QueuesJson.unescape(v.asBytes(), v.asBytesLength());
+    }
+
+    /** A JSON string's bytes with their escapes resolved (asString keeps them verbatim). */
+    static #String unescape(int8[] b, int32 len) {
+        int8[] out = heap int8[len < 1 ? 1L : (int64) len];
+        int32 o = 0;
+        int32 i = 0;
+        while (i < len) {
+            int32 c = ((int32) b[i]) & 0xff;
+            if (c != 92 || i + 1 >= len) {
+                out[o] = (int8) c;
+                o = o + 1;
+                i = i + 1;
+                continue;
+            }
+            int32 e = ((int32) b[i + 1]) & 0xff;
+            i = i + 2;
+            if (e == 110) { out[o] = (int8) 10; o = o + 1; }
+            else if (e == 116) { out[o] = (int8) 9; o = o + 1; }
+            else if (e == 114) { out[o] = (int8) 13; o = o + 1; }
+            else if (e == 98) { out[o] = (int8) 8; o = o + 1; }
+            else if (e == 102) { out[o] = (int8) 12; o = o + 1; }
+            else if (e == 117 && i + 4 <= len) {
+                int32 cp = 0;
+                for (int32 k = 0; k < 4; k++) {
+                    int32 h = ((int32) b[i + k]) & 0xff;
+                    int32 d = 0;
+                    if (h >= 48 && h <= 57) d = h - 48;
+                    else if (h >= 97 && h <= 102) d = h - 87;
+                    else if (h >= 65 && h <= 70) d = h - 55;
+                    cp = cp * 16 + d;
+                }
+                i = i + 4;
+                if (cp < 128) { out[o] = (int8) cp; o = o + 1; }
+                else if (cp < 2048) {
+                    out[o] = (int8) (192 | (cp >> 6)); out[o + 1] = (int8) (128 | (cp & 63)); o = o + 2;
+                } else {
+                    out[o] = (int8) (224 | (cp >> 12)); out[o + 1] = (int8) (128 | ((cp >> 6) & 63));
+                    out[o + 2] = (int8) (128 | (cp & 63)); o = o + 3;
+                }
+            } else { out[o] = (int8) e; o = o + 1; }
+        }
+        return heap String(#out, o);
+    }
+
+    /** `s` as a JSON string literal, quotes included. */
+    public static #String quote(String s) {
+        int32 n = s.byteLength();
+        int8[] out = heap int8[(int64) n * 6L + 2L];
+        int32 o = 0;
+        out[o] = (int8) 34;
+        o = o + 1;
+        for (int32 i = 0; i < n; i++) {
+            int32 c = ((int32) s.byteAt(i)) & 0xff;
+            if (c == 34 || c == 92) {
+                out[o] = (int8) 92; out[o + 1] = (int8) c; o = o + 2;
+            } else if (c < 32) {
+                out[o] = (int8) 92; out[o + 1] = (int8) 117; out[o + 2] = (int8) 48; out[o + 3] = (int8) 48;
+                int32 hi = c >> 4;
+                int32 lo = c & 15;
+                out[o + 4] = (int8) (hi < 10 ? 48 + hi : 87 + hi);
+                out[o + 5] = (int8) (lo < 10 ? 48 + lo : 87 + lo);
+                o = o + 6;
+            } else {
+                out[o] = (int8) c; o = o + 1;
+            }
+        }
+        out[o] = (int8) 34;
+        o = o + 1;
+        return heap String(#out, o);
+    }
+}

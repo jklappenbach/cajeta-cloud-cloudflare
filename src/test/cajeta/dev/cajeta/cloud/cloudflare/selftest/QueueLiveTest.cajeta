@@ -1,0 +1,38 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Skip;
+import dev.cajeta.cloud.testkit.QueueContract;
+import dev.cajeta.cloud.testkit.RealWaiter;
+import dev.cajeta.cloud.cloudflare.CloudflareChain;
+import dev.cajeta.cloud.cloudflare.CloudflareQueue;
+import dev.cajeta.cloud.cloudflare.HttpQueuesApi;
+
+/**
+ * The queue conformance suite against a real Cloudflare queue with an HTTP
+ * pull consumer (spec 5.2.6, 8.2; plan 5.3.1), opt-in through
+ * CAJETA_QUEUES_TEST_QUEUE_ID with the chain's account id and queues token
+ * in the environment. On the wall clock, so the redelivery cases wait for
+ * real visibility windows.
+ */
+public class QueueLiveTest {
+
+    public QueueLiveTest() {
+        return;
+    }
+
+    @Test
+    public void theQueueContractHoldsAgainstARealQueue() {
+        String queue #= System.env.get("CAJETA_QUEUES_TEST_QUEUE_ID");
+        if (queue == null || queue.byteLength() == 0) {
+            Skip.because("CAJETA_QUEUES_TEST_QUEUE_ID is not set; no Cloudflare queue to test against");
+        }
+        String account #= CloudflareChain.accountId(null);
+        String token #= CloudflareChain.apiToken(null, "queues");
+        HttpQueuesApi api = heap HttpQueuesApi(account, queue, token);
+        CloudflareQueue q #= CloudflareQueue.over(api);
+        RealWaiter w = heap RealWaiter();
+        QueueContract.verify(q, w);
+        return;
+    }
+}

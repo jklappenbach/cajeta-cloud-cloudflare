@@ -1,0 +1,209 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.codec.json.JsonValue;
+import cajeta.collection.ArrayList;
+import cajeta.concurrent.Fiber;
+import cajeta.lang.String;
+import cajeta.time.Duration;
+import dev.cajeta.cloud.Capabilities;
+import dev.cajeta.cloud.Caps;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.cloud.CloudStats;
+import dev.cajeta.cloud.RetryPolicy;
+import dev.cajeta.cloud.queue.Message;
+import dev.cajeta.cloud.queue.MessageAttributes;
+import dev.cajeta.cloud.queue.MessageQueue;
+import dev.cajeta.cloud.queue.Outgoing;
+import dev.cajeta.cloud.queue.Received;
+
+/**
+ * Cloudflare Queues behind the queue port (spec 5.2): sends through the REST
+ * API, receives through the HTTP pull consumer (a batch size and a
+ * visibility timeout), and the receipt is the message's lease id; acks and
+ * retries go to the ack endpoint, batching what the caller batched, a retry
+ * carrying its delay. Messages travel in the port's envelope (QueuesJson)
+ * so attributes round-trip. Declares `queue.delayed-send` and
+ * `queue.dead-letter-reporting` (the attempt count); not FIFO, exactly-once
+ * or message groups. Cloudflare's limits are refused by name before a
+ * request (128 KiB a message, 100 a batch or a pull, 12 hours of delay or
+ * visibility), a rate limit is TRANSIENT and retried under RetryPolicy.
+ *
+ * As the `cloudflare` component it configures itself on first use from
+ * CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_QUEUE_ID and the queues token of the
+ * chain (CLOUDFLARE_QUEUES_API_TOKEN, else CLOUDFLARE_API_TOKEN).
+ * Construction does nothing.
+ */
+@Component(name = "cloudflare")
+public final class CloudflareQueue implements MessageQueue {
+    QueuesApi api;
+    Capabilities caps;
+    CloudStats statsObj;
+    RetryPolicy retry;
+    boolean ready;
+
+    /** The `cloudflare` component: configured from the environment on first use. */
+    public CloudflareQueue() {
+        this.ready = false;
+        this.statsObj = heap CloudStats();
+        this.retry #= RetryPolicy.standard((uint64) 7);
+        this.caps #= CloudflareQueue.capabilitiesFor();
+        return;
+    }
+
+    /** A queue over the given API. */
+    public static #CloudflareQueue over(QueuesApi api) {
+        CloudflareQueue q = heap CloudflareQueue();
+        q.api #= api;
+        q.ready = true;
+        return #q;
+    }
+
+    static #Capabilities capabilitiesFor() {
+        Capabilities c = heap Capabilities("cloudflare");
+        c.declare(Caps.QUEUE_DELAYED_SEND(), "delay_seconds, up to 12 hours");
+        c.declare(Caps.QUEUE_DEAD_LETTER_REPORTING(), "the attempt count; the dead-letter queue is the queue's own setting");
+        return #c;
+    }
+
+    private void ensure() {
+        if (this.ready) return;
+        String account #= CloudflareChain.accountId(null);
+        String token #= CloudflareChain.apiToken(null, "queues");
+        String queue #= CloudflareChain.env("CLOUDFLARE_QUEUE_ID");
+        if (queue == null) {
+            throw heap CloudflareConfigurationException("no Cloudflare queue: CLOUDFLARE_QUEUE_ID is not set");
+        }
+        this.api = heap HttpQueuesApi(account, queue, token);
+        this.ready = true;
+    }
+
+    public Capabilities capabilities() { return this.caps; }
+    public CloudStats stats() { return this.statsObj; }
+
+    public #String send(int8[] body, MessageAttributes attributes, int64 delaySeconds) {
+        this.ensure();
+        CloudflareQueue.checkMessage(body, delaySeconds, "send");
+        String json #= QueuesJson.sendBody(body, attributes, delaySeconds);
+        JsonValue result #= this.call("messages", json);
+        ArrayList<String> ids #= QueuesJson.idsOf(result);
+        if (ids.count() == 0) return "" + "sent";
+        return "" + ids.get(0);
+    }
+
+    public #String[] sendBatch(ArrayList<Outgoing> messages) {
+        this.ensure();
+        int32 n = messages.count();
+        if (n > QueuesErrors.MAX_BATCH()) {
+            throw QueuesErrors.limit("sendBatch", "a batch of " + n + " messages is over the Queues limit of "
+                + QueuesErrors.MAX_BATCH() + " messages a batch");
+        }
+        ArrayList<String> bodies = heap ArrayList<String>();
+        for (int32 i = 0; i < n; i++) {
+            Outgoing o = messages.get(i);
+            CloudflareQueue.checkMessage(o.body(), o.delaySeconds(), "sendBatch");
+            String one #= QueuesJson.sendBody(o.body(), o.attributes(), o.delaySeconds());
+            bodies.add(#one);
+        }
+        String json #= QueuesJson.batchBody(bodies);
+        JsonValue result #= this.call("messages/batch", json);
+        ArrayList<String> ids #= QueuesJson.idsOf(result);
+        String[] out = heap String[(int64) n];
+        for (int32 i = 0; i < n; i++) {
+            if (i < ids.count()) out[i] #= "" + ids.get(i);
+            else out[i] #= "" + "sent";
+        }
+        return #out;
+    }
+
+    public #Received receive(int32 max, int64 visibilitySeconds) {
+        this.ensure();
+        if (max < 1 || max > QueuesErrors.MAX_PULL()) {
+            throw QueuesErrors.limit("receive", "a pull of " + max + " is outside the Queues limit of 1 to "
+                + QueuesErrors.MAX_PULL() + " messages a pull");
+        }
+        if (visibilitySeconds < 0L || visibilitySeconds > QueuesErrors.MAX_VISIBILITY_SECONDS()) {
+            throw QueuesErrors.limit("receive", "a visibility of " + visibilitySeconds
+                + " s is over the Queues limit of " + QueuesErrors.MAX_VISIBILITY_SECONDS() + " s");
+        }
+        String json #= QueuesJson.pullBody(max, visibilitySeconds);
+        JsonValue result #= this.call("messages/pull", json);
+        ArrayList<Message> list #= QueuesJson.messagesOf(result);
+        return heap Received(#list);
+    }
+
+    public void ack(String receipt) {
+        ArrayList<String> one = heap ArrayList<String>();
+        String r = "" + receipt;
+        one.add(#r);
+        this.ackAll(one);
+        return;
+    }
+
+    public void ackAll(ArrayList<String> receipts) {
+        this.ensure();
+        if (receipts.count() == 0) return;
+        ArrayList<String> none = heap ArrayList<String>();
+        String json #= QueuesJson.ackBody(receipts, none, 0L);
+        JsonValue result #= this.call("messages/ack", json);
+        int64 acked = QueuesJson.countOf(result, "ackCount");
+        if (acked < (int64) receipts.count()) {
+            throw heap CloudException(CloudException.PRECONDITION_FAILED(), "cloudflare", "ack", "-",
+                "" + ((int64) receipts.count() - acked) + " of " + receipts.count()
+                + " receipts were not acknowledged: the lease has expired or is not this queue's, and the message may have gone to another consumer");
+        }
+        return;
+    }
+
+    public void release(String receipt, int64 delaySeconds) {
+        this.ensure();
+        if (delaySeconds < 0L || delaySeconds > QueuesErrors.MAX_DELAY_SECONDS()) {
+            throw QueuesErrors.limit("release", "a delay of " + delaySeconds
+                + " s is over the Queues limit of " + QueuesErrors.MAX_DELAY_SECONDS() + " s");
+        }
+        ArrayList<String> none = heap ArrayList<String>();
+        ArrayList<String> one = heap ArrayList<String>();
+        String r = "" + receipt;
+        one.add(#r);
+        String json #= QueuesJson.ackBody(none, one, delaySeconds);
+        JsonValue result #= this.call("messages/ack", json);
+        int64 retried = QueuesJson.countOf(result, "retryCount");
+        if (retried < 1L) {
+            throw heap CloudException(CloudException.PRECONDITION_FAILED(), "cloudflare", "release", "-",
+                "the receipt was not released: the lease has expired or is not this queue's");
+        }
+        return;
+    }
+
+    static void checkMessage(int8[] body, int64 delaySeconds, String operation) {
+        int64 n = (int64) body.count();
+        if (n > QueuesErrors.MAX_MESSAGE_BYTES()) {
+            throw QueuesErrors.limit(operation, "a body of " + n + " bytes is over the Queues limit of "
+                + QueuesErrors.MAX_MESSAGE_BYTES() + " bytes (128 KiB) a message");
+        }
+        if (delaySeconds < 0L || delaySeconds > QueuesErrors.MAX_DELAY_SECONDS()) {
+            throw QueuesErrors.limit(operation, "a delay of " + delaySeconds
+                + " s is over the Queues limit of " + QueuesErrors.MAX_DELAY_SECONDS() + " s");
+        }
+        return;
+    }
+
+    // One REST call under the retry policy: a TRANSIENT answer is retried
+    // after the policy's delay, counted in the stats; the rest raise.
+    private #JsonValue call(String operation, String json) {
+        int32 attempt = 0;
+        while (true) {
+            QueuesReply r #= this.api.call(operation, json);
+            boolean failed = r.status() < 200 || r.status() >= 300;
+            this.statsObj.recordCall(0L, (int64) r.body().byteLength(), (int64) json.byteLength(), failed);
+            try {
+                return QueuesJson.resultOf(r, operation);
+            } catch (CloudException e) {
+                if (!this.retry.shouldRetry(e, attempt)) throw e;
+                this.statsObj.recordRetry();
+                int64 ms = this.retry.delayMillis(attempt);
+                Fiber.sleep(Duration.ofMillis(ms));
+                attempt = attempt + 1;
+            }
+        }
+    }
+}

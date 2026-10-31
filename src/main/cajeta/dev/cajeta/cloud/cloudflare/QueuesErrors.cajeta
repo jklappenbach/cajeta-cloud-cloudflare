@@ -1,0 +1,49 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+import dev.cajeta.cloud.CloudException;
+
+/**
+ * Queues REST errors as the parent's kinds (spec 5.2.4, 5.2.5, parent
+ * §11.1): a rate limit (429) is TRANSIENT, as is a 5xx; 401 and 403 are
+ * ACCESS_DENIED; 404 is NOT_FOUND; a queue with no HTTP pull consumer is a
+ * PROVIDER_ERROR naming the setting; a body or batch over a limit is a
+ * PROVIDER_ERROR naming the limit; the rest are PROVIDER_ERROR with the
+ * API's own message. The pull-consumer and size shapes are the fake's,
+ * verified against the real API when the account exists (plan 5.1.4).
+ */
+public final class QueuesErrors {
+
+    public static int64 MAX_MESSAGE_BYTES() { return 131072L; }
+    public static int32 MAX_BATCH() { return 100; }
+    public static int32 MAX_PULL() { return 100; }
+    public static int64 MAX_DELAY_SECONDS() { return 43200L; }
+    public static int64 MAX_VISIBILITY_SECONDS() { return 43200L; }
+
+    public static #CloudException of(int32 status, int32 code, String message, String operation) {
+        String lower #= message.toLowerCase();
+        int32 kind = CloudException.PROVIDER_ERROR();
+        String detail #= "" + message;
+        if (status == 429) {
+            kind = CloudException.TRANSIENT();
+            detail #= "rate limited by the Queues API: " + message;
+        } else if (status >= 500) {
+            kind = CloudException.TRANSIENT();
+        } else if (status == 401 || status == 403) {
+            kind = CloudException.ACCESS_DENIED();
+        } else if (status == 404) {
+            kind = CloudException.NOT_FOUND();
+        } else if (lower.indexOf("pull consumer") >= 0L) {
+            detail #= "the queue has no HTTP pull consumer; add one in the queue's settings (consumer type HTTP pull) before receiving: " + message;
+        } else if (status == 413 || lower.indexOf("too large") >= 0L || lower.indexOf("exceeds") >= 0L) {
+            detail #= "over a Queues limit (128 KiB a message, 100 messages or 256 KiB a batch): " + message;
+        }
+        if (code != 0) detail #= detail + " (code " + code + ")";
+        return heap CloudException(kind, "cloudflare", operation, "-", detail);
+    }
+
+    /** A client-side refusal of something over a documented limit, before any request. */
+    public static #CloudException limit(String operation, String what) {
+        return heap CloudException(CloudException.PROVIDER_ERROR(), "cloudflare", operation, "-", what);
+    }
+}

@@ -1,0 +1,215 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.Capabilities;
+import dev.cajeta.cloud.Caps;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.cloud.identity.ManualTimeSource;
+import dev.cajeta.cloud.queue.Message;
+import dev.cajeta.cloud.queue.MessageAttributes;
+import dev.cajeta.cloud.queue.Outgoing;
+import dev.cajeta.cloud.queue.Received;
+import dev.cajeta.cloud.testkit.ManualWaiter;
+import dev.cajeta.cloud.testkit.QueueContract;
+import dev.cajeta.cloud.cloudflare.CloudflareQueue;
+import dev.cajeta.cloud.cloudflare.HttpQueuesApi;
+import dev.cajeta.cloud.cloudflare.testkit.FakeQueuesApi;
+
+/**
+ * Cloudflare Queues behind the queue port (spec 5.2; plan 5.1.1 to 5.1.5)
+ * over FakeQueuesApi, an in-process stand-in for the Queues REST endpoints
+ * (send, batch send, pull, ack and retry) with leases, visibility timeouts
+ * and attempt counts on a manual clock. The receipt is the lease id; acks
+ * and retries batch what the caller batched; a queue without an HTTP pull
+ * consumer fails the first receive naming the setting; Cloudflare's limits
+ * are refused by name, and a rate limit is retried.
+ */
+public class CloudflareQueueTest {
+
+    public CloudflareQueueTest() {
+        return;
+    }
+
+    @Test
+    public void theQueueContractHoldsOverTheFake() {
+        ManualTimeSource clock = heap ManualTimeSource(1767225600L);
+        FakeQueuesApi fake = heap FakeQueuesApi(clock);
+        CloudflareQueue q #= CloudflareQueue.over(fake);
+        ManualWaiter w = heap ManualWaiter(clock);
+        QueueContract.verify(q, w);
+        Capabilities c = q.capabilities();
+        String name #= c.adapterName();
+        Assert.equals("cloudflare", name);
+        Assert.isTrue(c.supports(Caps.QUEUE_DELAYED_SEND()));
+        Assert.isFalse(c.supports(Caps.QUEUE_FIFO()));
+        Assert.isFalse(c.supports(Caps.QUEUE_EXACTLY_ONCE()));
+        Assert.isFalse(c.supports(Caps.QUEUE_MESSAGE_GROUPS()));
+        Assert.isTrue(c.supports(Caps.QUEUE_DEAD_LETTER_REPORTING()));
+        return;
+    }
+
+    @Test
+    public void theReceiptIsTheLeaseIdAndBatchesStayBatches() {
+        ManualTimeSource clock = heap ManualTimeSource(1767225600L);
+        FakeQueuesApi fake = heap FakeQueuesApi(clock);
+        CloudflareQueue q #= CloudflareQueue.over(fake);
+        ArrayList<Outgoing> batch = heap ArrayList<Outgoing>();
+        for (int32 i = 0; i < 3; i++) {
+            String text #= "m" + i;
+            MessageAttributes a = heap MessageAttributes();
+            a.add("n", text);
+            batch.add(heap Outgoing(text.toBytes(), #a, 0L));
+        }
+        String[] ids #= q.sendBatch(batch);
+        Assert.isTrue(ids.count() == 3);
+        Assert.isTrue(fake.calls("messages/batch") == 1);
+        Assert.isTrue(fake.calls("messages") == 0);
+        Received r #= q.receive(10, 30L);
+        Assert.isTrue(r.count() == 3);
+        Assert.isTrue(fake.sent("\"batch_size\":10"));
+        Assert.isTrue(fake.sent("\"visibility_timeout_ms\":30000"));
+        Message m = r.messageAt(0);
+        String receipt #= "" + m.receipt();
+        Assert.isTrue(receipt.indexOf("lease-") == 0L);
+        Assert.equals(fake.leaseOf(m.id()), receipt);
+        ArrayList<String> acks = heap ArrayList<String>();
+        for (int32 i = 0; i < 3; i++) {
+            String rc #= "" + r.messageAt(i).receipt();
+            acks.add(#rc);
+        }
+        q.ackAll(acks);
+        Assert.isTrue(fake.calls("messages/ack") == 1);
+        // A release is a retry with its delay, in the same endpoint.
+        String id #= q.send("later".toBytes(), heap MessageAttributes(), 0L);
+        Received r2 #= q.receive(1, 30L);
+        q.release(r2.messageAt(0).receipt(), 7L);
+        Assert.isTrue(fake.sent("\"retries\":[{\"lease_id\":\"" + r2.messageAt(0).receipt() + "\",\"delay_seconds\":7}]"));
+        Assert.isTrue(fake.calls("messages/ack") == 2);
+        // A send carries its delay and the port's envelope with the attributes.
+        MessageAttributes a2 = heap MessageAttributes();
+        a2.add("kind", "x");
+        String id2 #= q.send("body".toBytes(), a2, 5L);
+        Assert.isTrue(fake.sent("\"delay_seconds\":5"));
+        Assert.isTrue(fake.sent("\"attributes\":{\"kind\":\"x\"}"));
+        return;
+    }
+
+    @Test
+    public void anExpiredReceiptIsPreconditionFailed() {
+        ManualTimeSource clock = heap ManualTimeSource(1767225600L);
+        FakeQueuesApi fake = heap FakeQueuesApi(clock);
+        CloudflareQueue q #= CloudflareQueue.over(fake);
+        String id #= q.send("x".toBytes(), heap MessageAttributes(), 0L);
+        Received r #= q.receive(1, 5L);
+        clock.advance(6L);
+        int32 kind = -1;
+        try {
+            q.ack(r.messageAt(0).receipt());
+        } catch (CloudException e) {
+            kind = e.kind();
+        }
+        Assert.isTrue(kind == CloudException.PRECONDITION_FAILED());
+        kind = -1;
+        try {
+            q.ack("lease-never");
+        } catch (CloudException e) {
+            kind = e.kind();
+        }
+        Assert.isTrue(kind == CloudException.PRECONDITION_FAILED());
+        return;
+    }
+
+    @Test
+    public void aQueueWithoutAPullConsumerNamesTheSetting() {
+        ManualTimeSource clock = heap ManualTimeSource(1767225600L);
+        FakeQueuesApi fake = heap FakeQueuesApi(clock);
+        fake.withoutPullConsumer();
+        CloudflareQueue q #= CloudflareQueue.over(fake);
+        String id #= q.send("x".toBytes(), heap MessageAttributes(), 0L);
+        int32 kind = -1;
+        String message = "";
+        try {
+            Received r #= q.receive(1, 5L);
+        } catch (CloudException e) {
+            kind = e.kind();
+            message = "" + e.message;
+        }
+        Assert.isTrue(kind == CloudException.PROVIDER_ERROR());
+        Assert.isTrue(message.indexOf("HTTP pull consumer") >= 0L);
+        return;
+    }
+
+    @Test
+    public void limitsAreRefusedByNameAndARateLimitIsRetried() {
+        ManualTimeSource clock = heap ManualTimeSource(1767225600L);
+        FakeQueuesApi fake = heap FakeQueuesApi(clock);
+        CloudflareQueue q #= CloudflareQueue.over(fake);
+        int8[] big = heap int8[131073L];
+        String m1 #= CloudflareQueueTest.sendFails(q, big, 0L);
+        Assert.isTrue(m1.indexOf("131072") >= 0L);
+        Assert.isTrue(fake.calls("messages") == 0);
+        ArrayList<Outgoing> batch = heap ArrayList<Outgoing>();
+        for (int32 i = 0; i < 101; i++) batch.add(heap Outgoing("m".toBytes(), heap MessageAttributes(), 0L));
+        String m2 #= "" + "";
+        try {
+            String[] ids #= q.sendBatch(batch);
+        } catch (CloudException e) {
+            m2 #= "" + e.message;
+        }
+        Assert.isTrue(m2.indexOf("100") >= 0L);
+        Assert.isTrue(fake.calls("messages/batch") == 0);
+        int8[] ok = heap int8[4L];
+        String m3 #= CloudflareQueueTest.sendFails(q, ok, 43201L);
+        Assert.isTrue(m3.indexOf("43200") >= 0L);
+        String m4 #= "" + "";
+        try {
+            Received r #= q.receive(101, 30L);
+        } catch (CloudException e) {
+            m4 #= "" + e.message;
+        }
+        Assert.isTrue(m4.indexOf("100") >= 0L);
+        // One 429 is retried and the send succeeds; the retry is counted.
+        fake.rateLimitNext(1);
+        String id #= q.send(ok, heap MessageAttributes(), 0L);
+        Assert.isTrue(id.byteLength() > 0);
+        Assert.isTrue(q.stats().retries() == 1L);
+        Assert.isTrue(fake.calls("messages") == 2);
+        // A rate limit that never lifts is TRANSIENT after the policy's attempts.
+        fake.rateLimitNext(100);
+        int32 kind = -1;
+        try {
+            String id2 #= q.send(ok, heap MessageAttributes(), 0L);
+        } catch (CloudException e) {
+            kind = e.kind();
+        }
+        Assert.isTrue(kind == CloudException.TRANSIENT());
+        // The server's own refusal of a body is a provider error naming the limit.
+        fake.rateLimitNext(0);
+        fake.refuseNextAsTooLarge();
+        String m5 #= CloudflareQueueTest.sendFails(q, ok, 0L);
+        Assert.isTrue(m5.indexOf("128") >= 0L);
+        return;
+    }
+
+    @Test
+    public void theRestUrlsFollowTheAccountAndQueue() {
+        String url #= HttpQueuesApi.urlFor("0123456789abcdef", "q-id-1", "messages/pull");
+        Assert.equals("https://api.cloudflare.com/client/v4/accounts/0123456789abcdef/queues/q-id-1/messages/pull", url);
+        return;
+    }
+
+    static #String sendFails(CloudflareQueue q, int8[] body, int64 delay) {
+        String message #= "" + "";
+        int32 kind = -1;
+        try {
+            String id #= q.send(body, heap MessageAttributes(), delay);
+        } catch (CloudException e) {
+            message #= "" + e.message;
+            kind = e.kind();
+        }
+        Assert.isTrue(kind == CloudException.PROVIDER_ERROR());
+        return #message;
+    }
+}

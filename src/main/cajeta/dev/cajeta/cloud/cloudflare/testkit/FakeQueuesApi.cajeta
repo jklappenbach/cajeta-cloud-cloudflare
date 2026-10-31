@@ -1,0 +1,266 @@
+package dev.cajeta.cloud.cloudflare.testkit;
+
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonArray;
+import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonParseException;
+import cajeta.codec.json.JsonValue;
+import cajeta.collection.ArrayList;
+import cajeta.concurrent.Lock;
+import cajeta.concurrent.LockGuard;
+import cajeta.lang.String;
+import cajeta.lang.StringBuilder;
+import dev.cajeta.cloud.identity.TimeSource;
+import dev.cajeta.cloud.cloudflare.QueuesApi;
+import dev.cajeta.cloud.cloudflare.QueuesJson;
+import dev.cajeta.cloud.cloudflare.QueuesReply;
+
+/**
+ * An in-process Cloudflare Queues REST API (spec 8.1, plan 5.1.1): send,
+ * batch send, pull and ack in the shapes the API reference documents, with
+ * leases, visibility timeouts, delays and attempt counts on a TimeSource so
+ * a test steps time. A lease is `lease-<n>`; an ack or retry of a lease
+ * that has expired or never was is left out of `ackCount` / `retryCount`
+ * and named in `warnings`. `withoutPullConsumer` answers every pull with
+ * the no-HTTP-pull-consumer error; `rateLimitNext(n)` answers the next n
+ * calls 429; `refuseNextAsTooLarge` answers the next send 413. It logs
+ * every call's body.
+ */
+public final class FakeQueuesApi implements QueuesApi {
+    Lock lock;
+    TimeSource clock;
+    ArrayList<FakeQueuesMessage> messages;
+    int64 seq;
+    boolean pullConsumer;
+    int32 rateLimits;
+    boolean tooLarge;
+    ArrayList<String> ops;
+    ArrayList<String> bodies;
+
+    public FakeQueuesApi(^TimeSource clock) {
+        this.lock = heap Lock();
+        this.clock = clock;
+        this.messages = heap ArrayList<FakeQueuesMessage>();
+        this.seq = 0L;
+        this.pullConsumer = true;
+        this.rateLimits = 0;
+        this.tooLarge = false;
+        this.ops = heap ArrayList<String>();
+        this.bodies = heap ArrayList<String>();
+        return;
+    }
+
+    public void withoutPullConsumer() { this.pullConsumer = false; return; }
+    public void rateLimitNext(int32 n) { this.rateLimits = n; return; }
+    public void refuseNextAsTooLarge() { this.tooLarge = true; return; }
+
+    /** How many calls hit `operation`. */
+    public int32 calls(String operation) {
+        int32 n = 0;
+        for (int32 i = 0; i < this.ops.count(); i++) {
+            if (this.ops.get(i).equals(operation)) n = n + 1;
+        }
+        return n;
+    }
+
+    /** True when some call's body contains `text`. */
+    public boolean sent(String text) {
+        for (int32 i = 0; i < this.bodies.count(); i++) {
+            if (this.bodies.get(i).indexOf(text) >= 0L) return true;
+        }
+        return false;
+    }
+
+    /** The current lease of message `id`, or "". */
+    public #String leaseOf(String id) {
+        for (int32 i = 0; i < this.messages.count(); i++) {
+            FakeQueuesMessage m = this.messages.get(i);
+            if (m.id.equals(id)) return "" + m.lease;
+        }
+        return "" + "";
+    }
+
+    /** Messages still in the queue (held or not). */
+    public int32 pending() { return this.messages.count(); }
+
+    public #QueuesReply call(String operation, String jsonBody) {
+        LockGuard g #= this.lock.acquire();
+        String op = "" + operation;
+        String body = "" + jsonBody;
+        this.ops.add(#op);
+        this.bodies.add(#body);
+        if (this.rateLimits > 0) {
+            this.rateLimits = this.rateLimits - 1;
+            return FakeQueuesApi.error(429, 10000, "Rate limited. Please wait and consider throttling your request speed");
+        }
+        JsonValue root = null;
+        try {
+            root #= Json.parse(jsonBody);
+        } catch (JsonParseException e) {
+            return FakeQueuesApi.error(400, 10001, "Invalid JSON");
+        }
+        if (root.kind() != JsonValue.OBJECT) return FakeQueuesApi.error(400, 10001, "Invalid JSON");
+        JsonObject o = root.object();
+        if (operation.equals("messages")) return this.send(o);
+        if (operation.equals("messages/batch")) return this.sendBatch(o);
+        if (operation.equals("messages/pull")) return this.pull(o);
+        if (operation.equals("messages/ack")) return this.ack(o);
+        return FakeQueuesApi.error(404, 7000, "No route for that URI");
+    }
+
+    private #QueuesReply send(JsonObject o) {
+        if (this.tooLarge) {
+            this.tooLarge = false;
+            return FakeQueuesApi.error(413, 10015, "Message body too large: exceeds the 128 KB limit");
+        }
+        String id #= this.enqueue(o);
+        return FakeQueuesApi.ok("{\"id\":\"" + id + "\"}");
+    }
+
+    private #QueuesReply sendBatch(JsonObject o) {
+        JsonValue list = o.get("messages");
+        if (list == null || list.kind() != JsonValue.ARRAY) return FakeQueuesApi.error(400, 10001, "messages must be an array");
+        JsonArray arr = list.array();
+        if (arr.count() > 100) return FakeQueuesApi.error(400, 10016, "Batch exceeds the 100 message limit");
+        StringBuilder sb = heap StringBuilder();
+        sb.append("{\"messages\":[");
+        for (int32 i = 0; i < arr.count(); i++) {
+            JsonValue m = arr.get(i);
+            if (m.kind() != JsonValue.OBJECT) continue;
+            String id #= this.enqueue(m.object());
+            if (i > 0) sb.append(",");
+            sb.append("{\"id\":\"" + id + "\"}");
+        }
+        sb.append("]}");
+        String doc #= sb.toString();
+        return FakeQueuesApi.ok(doc);
+    }
+
+    // Stores the message's body text verbatim (the envelope the adapter sent).
+    private #String enqueue(JsonObject o) {
+        this.seq = this.seq + 1L;
+        String id #= "msg-" + this.seq;
+        JsonValue b = o.get("body");
+        String bodyText #= "" + "";
+        if (b != null) bodyText #= QueuesJson.stringify(b);
+        int64 delay = 0L;
+        JsonValue d = o.get("delay_seconds");
+        if (d != null && d.kind() == JsonValue.NUMBER) delay = d.asInt64();
+        int64 now = this.clock.nowSeconds();
+        FakeQueuesMessage m = heap FakeQueuesMessage(id, #bodyText, now * 1000L, now + delay);
+        this.messages.add(#m);
+        return #id;
+    }
+
+    private #QueuesReply pull(JsonObject o) {
+        if (!this.pullConsumer) {
+            return FakeQueuesApi.error(400, 10021, "Cannot pull from a queue that does not have an HTTP pull consumer configured");
+        }
+        int64 max = 1L;
+        JsonValue bs = o.get("batch_size");
+        if (bs != null && bs.kind() == JsonValue.NUMBER) max = bs.asInt64();
+        int64 vis = 30000L;
+        JsonValue vt = o.get("visibility_timeout_ms");
+        if (vt != null && vt.kind() == JsonValue.NUMBER) vis = vt.asInt64();
+        int64 now = this.clock.nowSeconds();
+        StringBuilder sb = heap StringBuilder();
+        sb.append("{\"messages\":[");
+        int64 given = 0L;
+        for (int32 i = 0; i < this.messages.count() && given < max; i++) {
+            FakeQueuesMessage m = this.messages.get(i);
+            if (m.visibleAt > now) continue;
+            if (m.lease.byteLength() > 0 && m.leaseUntil > now) continue;
+            this.seq = this.seq + 1L;
+            m.lease #= "lease-" + this.seq;
+            m.leaseUntil = now + (vis + 999L) / 1000L;
+            m.attempts = m.attempts + 1;
+            if (given > 0L) sb.append(",");
+            sb.append("{\"id\":\"" + m.id + "\",\"lease_id\":\"" + m.lease + "\",\"attempts\":" + m.attempts
+                + ",\"timestamp_ms\":" + m.timestampMs + ",\"body\":");
+            String quoted #= QueuesJson.quote(m.body);
+            sb.append(quoted);
+            sb.append(",\"metadata\":{\"CF-Content-Type\":\"json\"}}");
+            given = given + 1L;
+        }
+        sb.append("],\"message_backlog_count\":" + this.messages.count() + "}");
+        String doc #= sb.toString();
+        return FakeQueuesApi.ok(doc);
+    }
+
+    private #QueuesReply ack(JsonObject o) {
+        int64 now = this.clock.nowSeconds();
+        int64 acked = 0L;
+        int64 retried = 0L;
+        StringBuilder warnings = heap StringBuilder();
+        JsonValue acks = o.get("acks");
+        if (acks != null && acks.kind() == JsonValue.ARRAY) {
+            JsonArray arr = acks.array();
+            for (int32 i = 0; i < arr.count(); i++) {
+                String lease #= FakeQueuesApi.leaseIn(arr.get(i));
+                int32 at = this.findLease(lease, now);
+                if (at < 0) {
+                    FakeQueuesApi.warn(warnings, lease);
+                    continue;
+                }
+                FakeQueuesMessage gone #= this.messages.removeAt(at);
+                acked = acked + 1L;
+            }
+        }
+        JsonValue retries = o.get("retries");
+        if (retries != null && retries.kind() == JsonValue.ARRAY) {
+            JsonArray arr = retries.array();
+            for (int32 i = 0; i < arr.count(); i++) {
+                JsonValue r = arr.get(i);
+                String lease #= FakeQueuesApi.leaseIn(r);
+                int32 at = this.findLease(lease, now);
+                if (at < 0) {
+                    FakeQueuesApi.warn(warnings, lease);
+                    continue;
+                }
+                int64 delay = 0L;
+                if (r.kind() == JsonValue.OBJECT) {
+                    JsonValue d = r.object().get("delay_seconds");
+                    if (d != null && d.kind() == JsonValue.NUMBER) delay = d.asInt64();
+                }
+                FakeQueuesMessage m = this.messages.get(at);
+                m.lease #= "" + "";
+                m.leaseUntil = 0L;
+                m.visibleAt = now + delay;
+                retried = retried + 1L;
+            }
+        }
+        String w #= warnings.toString();
+        return FakeQueuesApi.ok("{\"ackCount\":" + acked + ",\"retryCount\":" + retried + ",\"warnings\":[" + w + "]}");
+    }
+
+    private int32 findLease(String lease, int64 now) {
+        if (lease.byteLength() == 0) return -1;
+        for (int32 i = 0; i < this.messages.count(); i++) {
+            FakeQueuesMessage m = this.messages.get(i);
+            if (m.lease.equals(lease) && m.leaseUntil > now) return i;
+        }
+        return -1;
+    }
+
+    static #String leaseIn(JsonValue v) {
+        if (v.kind() != JsonValue.OBJECT) return "" + "";
+        JsonValue l = v.object().get("lease_id");
+        if (l == null || l.kind() != JsonValue.STRING) return "" + "";
+        return l.asString();
+    }
+
+    static void warn(StringBuilder warnings, String lease) {
+        if (warnings.count() > 0L) warnings.append(",");
+        warnings.append("\"lease " + lease + " is expired or unknown\"");
+        return;
+    }
+
+    static #QueuesReply ok(String result) {
+        return heap QueuesReply(200, "{\"success\":true,\"errors\":[],\"messages\":[],\"result\":" + result + "}");
+    }
+
+    static #QueuesReply error(int32 status, int32 code, String message) {
+        return heap QueuesReply(status, "{\"success\":false,\"errors\":[{\"code\":" + code
+            + ",\"message\":\"" + message + "\"}],\"messages\":[],\"result\":null}");
+    }
+}

@@ -1,0 +1,50 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.error.RecoverableException;
+import cajeta.lang.String;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.http.ClientRequest;
+import dev.cajeta.http.ClientResponse;
+import dev.cajeta.http.client.HttpClient;
+
+/**
+ * The Queues REST API over cajeta-http (spec 5.2.1):
+ * `https://api.cloudflare.com/client/v4/accounts/<account>/queues/<queue>/<operation>`,
+ * a bearer API token scoped to the queue, JSON both ways. A connection
+ * failure is TRANSIENT; every HTTP answer is handed back for QueuesErrors
+ * to read.
+ */
+public final class HttpQueuesApi implements QueuesApi {
+    String base;
+    String token;
+    HttpClient client;
+
+    public HttpQueuesApi(String accountId, String queueId, String apiToken) {
+        this.base #= HttpQueuesApi.urlFor(accountId, queueId, "");
+        this.token = "" + apiToken;
+        this.client = heap HttpClient();
+        return;
+    }
+
+    public static #String urlFor(String accountId, String queueId, String operation) {
+        return "https://api.cloudflare.com/client/v4/accounts/" + accountId + "/queues/" + queueId
+            + "/" + operation;
+    }
+
+    public #QueuesReply call(String operation, String jsonBody) {
+        String url #= this.base + operation;
+        ClientRequest req #= ClientRequest.post(url);
+        req.header("Authorization", "Bearer " + this.token);
+        req.header("Content-Type", "application/json");
+        req.body(jsonBody);
+        ClientResponse r = null;
+        try {
+            r #= this.client.send(req);
+        } catch (RecoverableException e) {
+            throw heap CloudException(CloudException.TRANSIENT(), "cloudflare", operation, "-",
+                "the Queues API could not be reached: " + e.message);
+        }
+        String body #= r.bodyString();
+        return heap QueuesReply(r.status(), body);
+    }
+}

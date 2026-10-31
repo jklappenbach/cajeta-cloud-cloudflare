@@ -1,0 +1,18 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+
+/** One REST answer: the HTTP status and the JSON body. */
+public final class QueuesReply {
+    int32 code;
+    String text;
+
+    public QueuesReply(int32 status, String body) {
+        this.code = status;
+        this.text = "" + body;
+        return;
+    }
+
+    public int32 status() { return this.code; }
+    public String body() { return this.text; }
+}

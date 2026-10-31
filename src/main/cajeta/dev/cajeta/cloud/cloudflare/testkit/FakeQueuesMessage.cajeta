@@ -1,0 +1,25 @@
+package dev.cajeta.cloud.cloudflare.testkit;
+
+import cajeta.lang.String;
+
+/** One message in FakeQueuesApi: its body text as sent, its lease and when it is visible. */
+final class FakeQueuesMessage {
+    String id;
+    String body;
+    int64 timestampMs;
+    int64 visibleAt;
+    String lease;
+    int64 leaseUntil;
+    int32 attempts;
+
+    FakeQueuesMessage(String id, #String body, int64 timestampMs, int64 visibleAt) {
+        this.id = "" + id;
+        this.body #= body;
+        this.timestampMs = timestampMs;
+        this.visibleAt = visibleAt;
+        this.lease = "" + "";
+        this.leaseUntil = 0L;
+        this.attempts = 0;
+        return;
+    }
+}
