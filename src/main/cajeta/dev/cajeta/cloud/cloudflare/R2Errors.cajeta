@@ -1,0 +1,34 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.cloud.s3.S3Errors;
+import dev.cajeta.cloud.s3.S3Profile;
+
+/**
+ * R2's error codes as the parent's kinds (spec 3.6). R2 answers in S3's
+ * vocabulary for the operations it shares, so S3's table is the base; the
+ * entries here are R2's own, and `declare` writes them into the R2 profile
+ * so the shared store raises the right kind:
+ *
+ * - `TooManyRequests` (429): a rate limit, so transient;
+ * - `NotImplemented` (501): an S3 feature R2 lacks, a provider error whose
+ *   detail names it;
+ * - `InvalidArgument` (400) on a checksum algorithm or storage class R2 does
+ *   not support: a provider error, as on S3.
+ */
+public final class R2Errors {
+
+    public static int32 kindOf(int32 status, String code) {
+        if (code.equals("TooManyRequests")) return CloudException.TRANSIENT();
+        if (code.equals("NotImplemented")) return CloudException.PROVIDER_ERROR();
+        return S3Errors.kindOf(status, code);
+    }
+
+    /** Enter R2's own codes into `profile`. */
+    static void declare(S3Profile profile) {
+        profile.errorKind("TooManyRequests", CloudException.TRANSIENT());
+        profile.errorKind("NotImplemented", CloudException.PROVIDER_ERROR());
+        return;
+    }
+}

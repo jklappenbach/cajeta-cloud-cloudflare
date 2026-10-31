@@ -1,0 +1,68 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+
+/**
+ * What an application declares explicitly, the first step of the chain (spec
+ * 7.1, 7.2). Declare one as a component when values come from the
+ * application's own configuration rather than the environment. Any field may
+ * be null, and each null defers to its environment variable: the account id
+ * to CLOUDFLARE_ACCOUNT_ID, the API token to CLOUDFLARE_API_TOKEN, the R2 key
+ * pair to R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY, the jurisdiction to
+ * R2_JURISDICTION. `tokenFor(service, token)` gives one service its own token
+ * (least privilege); `toString` names the account only.
+ */
+public final class CloudflareConfig {
+    String account;
+    String token;
+    String r2Key;
+    String r2Secret;
+    String jurisdictionName;
+    ArrayList<String> services;
+    ArrayList<String> serviceTokens;
+
+    public CloudflareConfig(String accountId, String apiToken, String r2AccessKeyId,
+                            String r2SecretAccessKey) {
+        if (accountId != null) this.account #= "" + accountId;
+        if (apiToken != null) this.token #= "" + apiToken;
+        if (r2AccessKeyId != null) this.r2Key #= "" + r2AccessKeyId;
+        if (r2SecretAccessKey != null) this.r2Secret #= "" + r2SecretAccessKey;
+        this.services = heap ArrayList<String>();
+        this.serviceTokens = heap ArrayList<String>();
+        return;
+    }
+
+    /** The R2 jurisdiction: "eu", "fedramp", or "" for none. */
+    public void jurisdiction(String name) {
+        this.jurisdictionName #= "" + name;
+        return;
+    }
+
+    /** `service` ("queues", "kv", ...) uses `token` instead of the shared API token. */
+    public void tokenFor(String service, String token) {
+        String s = "" + service;
+        String t = "" + token;
+        this.services.add(#s);
+        this.serviceTokens.add(#t);
+        return;
+    }
+
+    public String accountId() { return this.account; }
+    public String apiToken() { return this.token; }
+    public String r2AccessKeyId() { return this.r2Key; }
+    public String r2SecretAccessKey() { return this.r2Secret; }
+    public String jurisdiction() { return this.jurisdictionName; }
+
+    /** The token given to `service` with `tokenFor`, or null. */
+    public String tokenOf(String service) {
+        for (int32 i = 0; i < this.services.count(); i++) {
+            if (this.services.get(i).equals(service)) return this.serviceTokens.get(i);
+        }
+        return null;
+    }
+
+    public #String toString() {
+        return "CloudflareConfig(" + this.account + ")";
+    }
+}

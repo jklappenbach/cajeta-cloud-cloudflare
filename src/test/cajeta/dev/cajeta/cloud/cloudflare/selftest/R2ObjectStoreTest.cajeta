@@ -1,0 +1,175 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.Capabilities;
+import dev.cajeta.cloud.Caps;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.cloud.object.MultipartUpload;
+import dev.cajeta.cloud.object.ObjectWriter;
+import dev.cajeta.cloud.testkit.ObjectStoreContract;
+import dev.cajeta.cloud.cloudflare.CloudflareConfig;
+import dev.cajeta.cloud.cloudflare.CloudflareConfigurationException;
+import dev.cajeta.cloud.cloudflare.R2ObjectStore;
+import dev.cajeta.cloud.s3.S3ObjectStore;
+import dev.cajeta.cloud.s3.S3Profile;
+import dev.cajeta.cloud.s3.testkit.FakeS3;
+
+/**
+ * R2 behind the object-store port (spec 3; plan 3.1.2 to 3.1.4, 3.1.6): the
+ * endpoint derived from the account id and jurisdiction, signed for region
+ * "auto" in path style; the R2 profile over the shared S3 client, which
+ * declares conditional writes only when R2_CONDITIONAL_WRITES=1 (spec Q1);
+ * the conformance suite against FakeS3 under both profiles; and R2's
+ * multipart rule (equal parts but the last, 5 MiB minimum) kept by the
+ * streaming writer and enforced by the fake.
+ */
+public class R2ObjectStoreTest {
+
+    public R2ObjectStoreTest() {
+        return;
+    }
+
+    @Test
+    public void theEndpointIsDerivedFromTheAccountAndJurisdiction() {
+        String plain #= R2ObjectStore.endpointFor("0123456789abcdef", "");
+        Assert.equals("https://0123456789abcdef.r2.cloudflarestorage.com", plain);
+        String eu #= R2ObjectStore.endpointFor("0123456789abcdef", "eu");
+        Assert.equals("https://0123456789abcdef.eu.r2.cloudflarestorage.com", eu);
+        String fed #= R2ObjectStore.endpointFor("0123456789abcdef", "fedramp");
+        Assert.equals("https://0123456789abcdef.fedramp.r2.cloudflarestorage.com", fed);
+        Assert.equals("auto", R2ObjectStore.SIGNING_REGION());
+        return;
+    }
+
+    @Test
+    public void connectBuildsAnR2StoreWithoutCallingAnything() {
+        CloudflareConfigTest.clearAll();
+        CloudflareConfig c = heap CloudflareConfig("0123456789abcdef", null, "r2key", "r2-secret");
+        S3ObjectStore s #= R2ObjectStore.connect("assets", c);
+        Capabilities caps = s.capabilities();
+        String name #= caps.adapterName();
+        Assert.equals("r2", name);
+        Assert.isTrue(caps.supports(Caps.MULTIPART()));
+        Assert.isTrue(caps.supports(Caps.RANGE_READ()));
+        Assert.isTrue(caps.supports(Caps.LIST_ORDERED()));
+        Assert.isTrue(caps.supports(Caps.READ_AFTER_WRITE()));
+        Assert.isTrue(caps.supports(Caps.SERVER_SIDE_COPY()));
+        Assert.isFalse(caps.supports(Caps.COND_PUT_CREATE()));
+        Assert.isFalse(caps.supports(Caps.COND_PUT_OVERWRITE()));
+        S3Profile p #= R2ObjectStore.profile(false);
+        String why #= p.caveatFor(Caps.COND_PUT_CREATE());
+        Assert.isTrue(why.indexOf("Q1") >= 0L);
+        Assert.isTrue(s.stats().requests() == 0L);
+        // The flag turns the conditional capabilities on for the day Q1 is answered.
+        System.env.set("R2_CONDITIONAL_WRITES", "1");
+        S3ObjectStore s2 #= R2ObjectStore.connect("assets", c);
+        Assert.isTrue(s2.capabilities().supports(Caps.COND_PUT_CREATE()));
+        Assert.isTrue(s2.capabilities().supports(Caps.COND_PUT_OVERWRITE()));
+        CloudflareConfigTest.clearAll();
+        return;
+    }
+
+    @Test
+    public void connectNamesWhatTheChainLacks() {
+        CloudflareConfigTest.clearAll();
+        String message = "";
+        try {
+            S3ObjectStore s #= R2ObjectStore.connect("assets", null);
+        } catch (CloudflareConfigurationException e) {
+            message = "" + e.message;
+        }
+        Assert.isTrue(message.indexOf("CLOUDFLARE_ACCOUNT_ID") >= 0L);
+        return;
+    }
+
+    @Test
+    public void theProfileExcludesConditionalWritesUntilQ1AndKeepsR2sPartRule() {
+        S3Profile p #= R2ObjectStore.profile(false);
+        Assert.equals("r2", p.name());
+        Assert.isTrue(p.excludes(Caps.COND_PUT_CREATE()));
+        Assert.isTrue(p.excludes(Caps.COND_PUT_OVERWRITE()));
+        Assert.isFalse(p.excludes(Caps.SERVER_SIDE_COPY()));
+        Assert.isTrue(p.minPartSize() == 5242880L);
+        Assert.isTrue(p.uniformParts());
+        S3Profile q #= R2ObjectStore.profile(true);
+        Assert.isFalse(q.excludes(Caps.COND_PUT_CREATE()));
+        Assert.isTrue(q.uniformParts());
+        return;
+    }
+
+    @Test
+    public void theObjectStoreContractHoldsAgainstAnR2ProfiledFake() {
+        // Without conditional writes: the contract takes the undeclared branch,
+        // which asserts the clean refusal.
+        FakeS3 fake = heap FakeS3();
+        fake.partRule(5242880L, true);
+        S3ObjectStore s #= heap S3ObjectStore(fake, "assets", 5242880L, R2ObjectStore.profile(false));
+        ObjectStoreContract.verify(s, "contract/");
+        Assert.isTrue(fake.sent("[If-None-Match: *]") == false);
+        // With them: the conditional and concurrent-writers cases run in full.
+        FakeS3 fake2 = heap FakeS3();
+        fake2.partRule(5242880L, true);
+        S3ObjectStore s2 #= heap S3ObjectStore(fake2, "assets", 5242880L, R2ObjectStore.profile(true));
+        ObjectStoreContract.verify(s2, "contract/");
+        Assert.isTrue(fake2.sent("[If-None-Match: *]"));
+        return;
+    }
+
+    @Test
+    public void theWriterSizesPartsToR2sRuleAndUnequalHandPartsAreRefused() {
+        FakeS3 fake = heap FakeS3();
+        fake.partRule(5242880L, true);
+        S3ObjectStore s #= heap S3ObjectStore(fake, "assets", 5242880L, R2ObjectStore.profile(false));
+        // 12.5 MiB through the streaming writer: two 5 MiB parts and a tail.
+        ObjectWriter w #= s.openWrite("big", "application/octet-stream");
+        int8[] chunk #= R2ObjectStoreTest.filled(1048576L);
+        for (int32 i = 0; i < 12; i++) w.write(chunk, 1048576L);
+        int8[] half #= R2ObjectStoreTest.filled(524288L);
+        w.write(half, 524288L);
+        String etag #= w.complete();
+        Assert.isTrue(s.stat("big").size == 13107200L);
+        Assert.isTrue(fake.largestPart == 5242880L);
+        Assert.isTrue(fake.openUploads() == 0);
+        // Parts of unequal size by hand break R2's rule; the fake refuses them.
+        MultipartUpload up #= s.beginMultipart("hand", "t");
+        up.addPart(1, R2ObjectStoreTest.filled(5242880L));
+        up.addPart(2, R2ObjectStoreTest.filled(6291456L));
+        up.addPart(3, R2ObjectStoreTest.filled(16L));
+        int32 kind = -1;
+        String message = "";
+        try {
+            String tag #= up.complete();
+        } catch (CloudException e) {
+            kind = e.kind();
+            message = "" + e.message;
+        }
+        Assert.isTrue(kind == CloudException.PROVIDER_ERROR());
+        Assert.isTrue(message.indexOf("InvalidPart") >= 0L);
+        Assert.isTrue(message.indexOf("r2: complete") >= 0L);
+        return;
+    }
+
+    @Test
+    public void aPartSizeUnderR2sMinimumIsRefusedAtOpen() {
+        CloudflareConfigTest.clearAll();
+        CloudflareConfig c = heap CloudflareConfig("0123456789abcdef", null, "r2key", "r2-secret");
+        int32 kind = -1;
+        String message = "";
+        try {
+            S3ObjectStore s #= R2ObjectStore.connect("assets", c, 65536L);
+        } catch (CloudException e) {
+            kind = e.kind();
+            message = "" + e.message;
+        }
+        Assert.isTrue(kind == CloudException.PROVIDER_ERROR());
+        Assert.isTrue(message.indexOf("5242880") >= 0L);
+        return;
+    }
+
+    static #int8[] filled(int64 n) {
+        int8[] b = heap int8[n];
+        for (int64 i = 0L; i < n; i++) b[i] = (int8) 120;
+        return #b;
+    }
+}

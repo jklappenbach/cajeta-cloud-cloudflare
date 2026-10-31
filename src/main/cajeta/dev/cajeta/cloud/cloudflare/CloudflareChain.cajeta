@@ -1,0 +1,128 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+import dev.cajeta.cloud.s3.S3Credentials;
+
+/**
+ * Where each value the adapters need comes from (spec 7.1, 7.2), first match
+ * wins: the application's `CloudflareConfig`, then the environment. An empty
+ * variable counts as unset. When neither yields a value, the resolver throws
+ * `CloudflareConfigurationException` naming the config field and the
+ * variable; no message carries a value.
+ *
+ * | value | config | environment |
+ * |---|---|---|
+ * | account id | `accountId` | `CLOUDFLARE_ACCOUNT_ID` |
+ * | API token for `service` | `tokenFor(service)`, else `apiToken` | `CLOUDFLARE_<SERVICE>_API_TOKEN`, else `CLOUDFLARE_API_TOKEN` |
+ *
+ * A config's shared token beats a service variable: the application said
+ * what to use, and the environment fills only what it left unsaid.
+ * | R2 keys | `r2AccessKeyId` + `r2SecretAccessKey` | `R2_ACCESS_KEY_ID` + `R2_SECRET_ACCESS_KEY` |
+ * | R2 jurisdiction | `jurisdiction` | `R2_JURISDICTION`, else none |
+ */
+public final class CloudflareChain {
+
+    /** The account id and the shared API token. */
+    public static #CloudflareCredentials resolve(CloudflareConfig config) {
+        String account #= CloudflareChain.accountId(config);
+        String token #= CloudflareChain.apiToken(config, null);
+        return heap CloudflareCredentials(account, token);
+    }
+
+    public static #String accountId(CloudflareConfig config) {
+        if (config != null && !CloudflareChain.blank(config.accountId())) {
+            return "" + config.accountId();
+        }
+        String v #= CloudflareChain.env("CLOUDFLARE_ACCOUNT_ID");
+        if (v != null) return #v;
+        throw heap CloudflareConfigurationException("no Cloudflare account id: "
+            + "CloudflareConfig.accountId is not set and CLOUDFLARE_ACCOUNT_ID is not set");
+    }
+
+    /**
+     * The API token `service` ("queues", "kv"; null for the shared one) uses,
+     * config before environment: the config's token for that service, else
+     * the config's shared token, else CLOUDFLARE_<SERVICE>_API_TOKEN, else
+     * CLOUDFLARE_API_TOKEN.
+     */
+    public static #String apiToken(CloudflareConfig config, String service) {
+        boolean named = service != null && service.byteLength() > 0;
+        if (config != null) {
+            if (named) {
+                String own = config.tokenOf(service);
+                if (!CloudflareChain.blank(own)) return "" + own;
+            }
+            if (!CloudflareChain.blank(config.apiToken())) return "" + config.apiToken();
+        }
+        String serviceVar #= "" + "";
+        if (named) {
+            String upper #= service.toUpperCase();
+            serviceVar #= "CLOUDFLARE_" + upper + "_API_TOKEN";
+            String v #= CloudflareChain.env(serviceVar);
+            if (v != null) return #v;
+        }
+        String shared #= CloudflareChain.env("CLOUDFLARE_API_TOKEN");
+        if (shared != null) return #shared;
+        String tried #= "" + "";
+        if (serviceVar.byteLength() > 0) {
+            tried #= "CloudflareConfig.tokenFor(\"" + service + "\") is not set, " + serviceVar + " is not set, ";
+        }
+        throw heap CloudflareConfigurationException("no Cloudflare API token: " + tried
+            + "CloudflareConfig.apiToken is not set and CLOUDFLARE_API_TOKEN is not set");
+    }
+
+    /** The R2 S3 key pair, as `S3Credentials` without a session token. */
+    public static #S3Credentials r2Credentials(CloudflareConfig config) {
+        String id = null;
+        String secret = null;
+        if (config != null) {
+            id = config.r2AccessKeyId();
+            secret = config.r2SecretAccessKey();
+        }
+        if (!CloudflareChain.blank(id) && !CloudflareChain.blank(secret)) {
+            return heap S3Credentials(id, secret, null);
+        }
+        String eid #= CloudflareChain.env("R2_ACCESS_KEY_ID");
+        String esecret #= CloudflareChain.env("R2_SECRET_ACCESS_KEY");
+        String keyId = CloudflareChain.blank(id) ? eid : id;
+        String key = CloudflareChain.blank(secret) ? esecret : secret;
+        if (keyId != null && key != null) {
+            return heap S3Credentials(keyId, key, null);
+        }
+        if (keyId == null) {
+            throw heap CloudflareConfigurationException("no R2 access key: "
+                + "CloudflareConfig.r2AccessKeyId is not set and R2_ACCESS_KEY_ID is not set");
+        }
+        throw heap CloudflareConfigurationException("no R2 secret: "
+            + "CloudflareConfig.r2SecretAccessKey is not set and R2_SECRET_ACCESS_KEY is not set");
+    }
+
+    /** The R2 jurisdiction: "eu", "fedramp", or "" for the default location. */
+    public static #String jurisdiction(CloudflareConfig config) {
+        String j #= "" + "";
+        String source #= "" + "CloudflareConfig.jurisdiction";
+        if (config != null && !CloudflareChain.blank(config.jurisdiction())) {
+            j #= "" + config.jurisdiction();
+        } else {
+            String v #= CloudflareChain.env("R2_JURISDICTION");
+            if (v != null) {
+                j #= #v;
+                source #= "" + "R2_JURISDICTION";
+            }
+        }
+        if (j.byteLength() == 0 || j.equals("eu") || j.equals("fedramp")) return #j;
+        throw heap CloudflareConfigurationException("unknown R2 jurisdiction '" + j + "' in " + source
+            + ": the jurisdictions are eu and fedramp, or unset for the default location");
+    }
+
+    // The variable's value, or null when it is unset or empty.
+    static #String env(String name) {
+        String v #= System.env.get(name);
+        if (v == null || v.byteLength() == 0) return null;
+        return #v;
+    }
+
+    static boolean blank(String s) {
+        return s == null || s.byteLength() == 0;
+    }
+}

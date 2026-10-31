@@ -1,0 +1,17 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.cloudflare.Cloudflare;
+
+public class CloudflareTest {
+
+    public CloudflareTest() {
+        return;
+    }
+
+    @Test
+    public void versionIsTheManifestVersion() {
+        Assert.that(Cloudflare.version()).isEqualTo("0.1.0");
+        return;
+    }
+}

@@ -1,0 +1,85 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+import dev.cajeta.cloud.Caps;
+import dev.cajeta.cloud.s3.S3Config;
+import dev.cajeta.cloud.s3.S3Credentials;
+import dev.cajeta.cloud.s3.S3Endpoint;
+import dev.cajeta.cloud.s3.S3ObjectStore;
+import dev.cajeta.cloud.s3.S3Profile;
+
+/**
+ * R2 behind the object-store port (spec 3): the `S3ObjectStore` is
+ * `dev.cajeta.cloud.s3`'s, shared with every S3-compatible provider; this is
+ * the R2 way of building one. The endpoint is derived from the account id
+ * and the optional jurisdiction, requests are signed for region "auto" in
+ * path style, and the R2 profile declares what R2 lacks or rules differently:
+ *
+ * - every part but the last of a multipart upload the same size, 5 MiB at
+ *   least (3.4); the streaming writer keeps this by construction;
+ * - conditional writes (`If-None-Match: *`, `If-Match`) are declared only
+ *   when `R2_CONDITIONAL_WRITES=1`, until spec Q1 is verified against a real
+ *   bucket (3.3); without the flag `putIfAbsent` and `putIfMatch` refuse
+ *   cleanly per parent §3.2;
+ * - R2's own error codes (`R2Errors`).
+ *
+ * Object lock, ACLs, SSE-KMS and the checksum algorithms R2 lacks (3.5) are
+ * not operations of the port, so nothing here can ask for them.
+ */
+public final class R2ObjectStore {
+
+    /** The SigV4 signing region R2 documents. */
+    public static String SIGNING_REGION() { return "auto"; }
+
+    /** The default part size for streamed writes: R2's minimum, 5 MiB. */
+    public static int64 DEFAULT_PART_SIZE() { return 5242880L; }
+
+    /**
+     * A store over `bucket` with the chain's account id, jurisdiction and R2
+     * keys (`config` may be null), at the default part size. A missing value
+     * throws CloudflareConfigurationException naming it; nothing is called
+     * until the first operation.
+     */
+    public static #S3ObjectStore connect(String bucket, CloudflareConfig config) {
+        return R2ObjectStore.connect(bucket, config, R2ObjectStore.DEFAULT_PART_SIZE());
+    }
+
+    /** `connect` with a part size; one under R2's minimum is refused here, naming the minimum. */
+    public static #S3ObjectStore connect(String bucket, CloudflareConfig config, int64 partSize) {
+        String account #= CloudflareChain.accountId(config);
+        String jurisdiction #= CloudflareChain.jurisdiction(config);
+        S3Credentials creds #= CloudflareChain.r2Credentials(config);
+        String base #= R2ObjectStore.endpointFor(account, jurisdiction);
+        S3Endpoint where #= S3Endpoint.at(base, R2ObjectStore.SIGNING_REGION(), true);
+        S3Config c = heap S3Config(#where, bucket, #creds);
+        c.partSize(partSize);
+        String flag #= CloudflareChain.env("R2_CONDITIONAL_WRITES");
+        boolean conditional = flag != null && flag.equals("1");
+        return S3ObjectStore.open(c, R2ObjectStore.profile(conditional));
+    }
+
+    /**
+     * The S3 API endpoint for `accountId`: `https://<account>.r2.cloudflarestorage.com`,
+     * or `https://<account>.<jurisdiction>.r2.cloudflarestorage.com` when a
+     * jurisdiction is given.
+     */
+    public static #String endpointFor(String accountId, String jurisdiction) {
+        if (jurisdiction == null || jurisdiction.byteLength() == 0) {
+            return "https://" + accountId + ".r2.cloudflarestorage.com";
+        }
+        return "https://" + accountId + "." + jurisdiction + ".r2.cloudflarestorage.com";
+    }
+
+    /** The R2 profile; `conditionalWrites` declares the two conditional capabilities (spec Q1). */
+    public static #S3Profile profile(boolean conditionalWrites) {
+        S3Profile p = heap S3Profile("r2");
+        p.partRule(5242880L, true);
+        if (!conditionalWrites) {
+            String why = "not declared until spec Q1 verifies If-None-Match and If-Match on R2's PutObject; set R2_CONDITIONAL_WRITES=1 to declare them";
+            p.exclude(Caps.COND_PUT_CREATE(), why);
+            p.exclude(Caps.COND_PUT_OVERWRITE(), why);
+        }
+        R2Errors.declare(p);
+        return #p;
+    }
+}

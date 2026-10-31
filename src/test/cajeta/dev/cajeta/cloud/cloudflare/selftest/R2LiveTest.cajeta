@@ -1,0 +1,34 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Skip;
+import dev.cajeta.cloud.testkit.ObjectStoreContract;
+import dev.cajeta.cloud.cloudflare.R2ObjectStore;
+import dev.cajeta.cloud.s3.S3ObjectStore;
+
+/**
+ * The object-store conformance suite against a real R2 bucket (spec 3.2, 8.2;
+ * plan 3.3.1), opt-in through CAJETA_R2_TEST_BUCKET with the chain's account
+ * id, R2 keys and optional jurisdiction in the environment. With
+ * R2_CONDITIONAL_WRITES=1 the conditional and concurrent-writers cases run
+ * too (spec Q1). Writes under a run-unique prefix (spec 8.3).
+ */
+public class R2LiveTest {
+
+    public R2LiveTest() {
+        return;
+    }
+
+    @Test
+    public void theObjectStoreContractHoldsAgainstARealBucket() {
+        String bucket #= System.env.get("CAJETA_R2_TEST_BUCKET");
+        if (bucket == null || bucket.byteLength() == 0) {
+            Skip.because("CAJETA_R2_TEST_BUCKET is not set; no R2 bucket to test against");
+        }
+        S3ObjectStore s #= R2ObjectStore.connect(bucket, null);
+        String run #= System.env.get("GITHUB_RUN_ID");
+        String prefix #= "cajeta-conformance/" + (run == null ? "local" : run) + "/";
+        ObjectStoreContract.verify(s, prefix);
+        return;
+    }
+}

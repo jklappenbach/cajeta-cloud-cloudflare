@@ -1,0 +1,192 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.s3.S3Credentials;
+import dev.cajeta.cloud.cloudflare.CloudflareChain;
+import dev.cajeta.cloud.cloudflare.CloudflareConfig;
+import dev.cajeta.cloud.cloudflare.CloudflareConfigurationException;
+import dev.cajeta.cloud.cloudflare.CloudflareCredentials;
+
+/**
+ * Where the adapters' configuration comes from (spec 7.1, 7.2; plan 3.1.1):
+ * an explicit CloudflareConfig component first, then the environment
+ * (CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, R2_ACCESS_KEY_ID,
+ * R2_SECRET_ACCESS_KEY, the optional R2_JURISDICTION). A service may be given
+ * its own token (CloudflareConfig.tokenFor, or CLOUDFLARE_<SERVICE>_API_TOKEN),
+ * else the shared one. A missing value fails at configuration naming the
+ * variable, and no message carries a value. An empty variable counts as
+ * unset. Each test clears the variables it touches.
+ */
+public class CloudflareConfigTest {
+
+    public CloudflareConfigTest() {
+        return;
+    }
+
+    @Test
+    public void aConfigComponentWinsOverTheEnvironment() {
+        CloudflareConfigTest.clearAll();
+        System.env.set("CLOUDFLARE_ACCOUNT_ID", "envaccount");
+        System.env.set("CLOUDFLARE_API_TOKEN", "env-token");
+        CloudflareConfig c = heap CloudflareConfig("cfgaccount", "cfg-token", "cfgkey", "cfg-secret");
+        CloudflareCredentials r #= CloudflareChain.resolve(c);
+        Assert.equals("cfgaccount", r.accountId());
+        Assert.equals("cfg-token", r.apiToken());
+        String id #= CloudflareChain.accountId(c);
+        Assert.equals("cfgaccount", id);
+        S3Credentials k #= CloudflareChain.r2Credentials(c);
+        Assert.equals("cfgkey", k.accessKeyId());
+        Assert.equals("cfg-secret", k.secretAccessKey());
+        Assert.isFalse(k.hasSessionToken());
+        CloudflareConfigTest.clearAll();
+        return;
+    }
+
+    @Test
+    public void theEnvironmentFillsWhatTheConfigLeavesNull() {
+        CloudflareConfigTest.clearAll();
+        System.env.set("CLOUDFLARE_ACCOUNT_ID", "envaccount");
+        System.env.set("CLOUDFLARE_API_TOKEN", "env-token");
+        System.env.set("R2_ACCESS_KEY_ID", "envkey");
+        System.env.set("R2_SECRET_ACCESS_KEY", "env-secret");
+        System.env.set("R2_JURISDICTION", "eu");
+        CloudflareCredentials r #= CloudflareChain.resolve(null);
+        Assert.equals("envaccount", r.accountId());
+        Assert.equals("env-token", r.apiToken());
+        S3Credentials k #= CloudflareChain.r2Credentials(null);
+        Assert.equals("envkey", k.accessKeyId());
+        Assert.equals("env-secret", k.secretAccessKey());
+        String j #= CloudflareChain.jurisdiction(null);
+        Assert.equals("eu", j);
+        // A partial config defers each missing field to the environment.
+        CloudflareConfig half = heap CloudflareConfig("cfgaccount", null, null, null);
+        CloudflareCredentials r2 #= CloudflareChain.resolve(half);
+        Assert.equals("cfgaccount", r2.accountId());
+        Assert.equals("env-token", r2.apiToken());
+        CloudflareConfigTest.clearAll();
+        return;
+    }
+
+    @Test
+    public void jurisdictionDefaultsToNoneAndRefusesAnUnknownOne() {
+        CloudflareConfigTest.clearAll();
+        String none #= CloudflareChain.jurisdiction(null);
+        Assert.equals("", none);
+        CloudflareConfig c = heap CloudflareConfig(null, null, null, null);
+        c.jurisdiction("fedramp");
+        String f #= CloudflareChain.jurisdiction(c);
+        Assert.equals("fedramp", f);
+        System.env.set("R2_JURISDICTION", "mars");
+        String message #= CloudflareConfigTest.jurisdictionFails(null);
+        Assert.isTrue(message.indexOf("R2_JURISDICTION") >= 0L);
+        Assert.isTrue(message.indexOf("mars") >= 0L);
+        Assert.isTrue(message.indexOf("eu") >= 0L);
+        CloudflareConfigTest.clearAll();
+        return;
+    }
+
+    @Test
+    public void aServiceTokenOverridesTheSharedOne() {
+        CloudflareConfigTest.clearAll();
+        System.env.set("CLOUDFLARE_API_TOKEN", "shared-token");
+        String shared #= CloudflareChain.apiToken(null, "queues");
+        Assert.equals("shared-token", shared);
+        System.env.set("CLOUDFLARE_QUEUES_API_TOKEN", "queues-token");
+        String fromEnv #= CloudflareChain.apiToken(null, "queues");
+        Assert.equals("queues-token", fromEnv);
+        String kv #= CloudflareChain.apiToken(null, "kv");
+        Assert.equals("shared-token", kv);
+        CloudflareConfig c = heap CloudflareConfig(null, "cfg-shared", null, null);
+        c.tokenFor("kv", "cfg-kv-token");
+        String cfgKv #= CloudflareChain.apiToken(c, "kv");
+        Assert.equals("cfg-kv-token", cfgKv);
+        String cfgQueues #= CloudflareChain.apiToken(c, "queues");
+        Assert.equals("cfg-shared", cfgQueues);
+        CloudflareConfigTest.clearAll();
+        return;
+    }
+
+    @Test
+    public void aMissingValueNamesTheVariableAndNoSecret() {
+        CloudflareConfigTest.clearAll();
+        System.env.set("R2_SECRET_ACCESS_KEY", "TOPSECRETVALUE");
+        String m1 #= CloudflareConfigTest.resolveFails(null);
+        Assert.isTrue(m1.indexOf("CLOUDFLARE_ACCOUNT_ID") >= 0L);
+        Assert.isTrue(m1.indexOf("CloudflareConfig") >= 0L);
+        Assert.isTrue(m1.indexOf("TOPSECRETVALUE") < 0L);
+        System.env.set("CLOUDFLARE_ACCOUNT_ID", "envaccount");
+        String m2 #= CloudflareConfigTest.resolveFails(null);
+        Assert.isTrue(m2.indexOf("CLOUDFLARE_API_TOKEN") >= 0L);
+        Assert.isTrue(m2.indexOf("CLOUDFLARE_ACCOUNT_ID") < 0L);
+        String m3 #= CloudflareConfigTest.r2Fails(null);
+        Assert.isTrue(m3.indexOf("R2_ACCESS_KEY_ID") >= 0L);
+        Assert.isTrue(m3.indexOf("TOPSECRETVALUE") < 0L);
+        // A config declared with a key id and no secret is an incomplete pair.
+        CloudflareConfig c = heap CloudflareConfig(null, null, "cfgkey", null);
+        System.env.set("R2_SECRET_ACCESS_KEY", "");
+        String m4 #= CloudflareConfigTest.r2Fails(c);
+        Assert.isTrue(m4.indexOf("R2_SECRET_ACCESS_KEY") >= 0L);
+        Assert.isTrue(m4.indexOf("cfgkey") < 0L);
+        CloudflareConfigTest.clearAll();
+        return;
+    }
+
+    @Test
+    public void credentialsPrintTheAccountOnly() {
+        CloudflareCredentials c = heap CloudflareCredentials("acct", "a-secret-token");
+        String text #= c.toString();
+        Assert.isTrue(text.indexOf("acct") >= 0L);
+        Assert.isTrue(text.indexOf("a-secret-token") < 0L);
+        CloudflareConfig cfg = heap CloudflareConfig("acct", "tok", "key", "sec");
+        String ctext #= cfg.toString();
+        Assert.isTrue(ctext.indexOf("tok") < 0L);
+        Assert.isTrue(ctext.indexOf("sec") < 0L);
+        return;
+    }
+
+    static #String resolveFails(CloudflareConfig c) {
+        String message #= "" + "";
+        try {
+            CloudflareCredentials r #= CloudflareChain.resolve(c);
+        } catch (CloudflareConfigurationException e) {
+            message #= "" + e.message;
+        }
+        Assert.isTrue(message.byteLength() > 0);
+        return #message;
+    }
+
+    static #String r2Fails(CloudflareConfig c) {
+        String message #= "" + "";
+        try {
+            S3Credentials k #= CloudflareChain.r2Credentials(c);
+        } catch (CloudflareConfigurationException e) {
+            message #= "" + e.message;
+        }
+        Assert.isTrue(message.byteLength() > 0);
+        return #message;
+    }
+
+    static #String jurisdictionFails(CloudflareConfig c) {
+        String message #= "" + "";
+        try {
+            String j #= CloudflareChain.jurisdiction(c);
+        } catch (CloudflareConfigurationException e) {
+            message #= "" + e.message;
+        }
+        Assert.isTrue(message.byteLength() > 0);
+        return #message;
+    }
+
+    static void clearAll() {
+        System.env.set("CLOUDFLARE_ACCOUNT_ID", "");
+        System.env.set("CLOUDFLARE_API_TOKEN", "");
+        System.env.set("CLOUDFLARE_QUEUES_API_TOKEN", "");
+        System.env.set("CLOUDFLARE_KV_API_TOKEN", "");
+        System.env.set("R2_ACCESS_KEY_ID", "");
+        System.env.set("R2_SECRET_ACCESS_KEY", "");
+        System.env.set("R2_JURISDICTION", "");
+        System.env.set("R2_CONDITIONAL_WRITES", "");
+        return;
+    }
+}

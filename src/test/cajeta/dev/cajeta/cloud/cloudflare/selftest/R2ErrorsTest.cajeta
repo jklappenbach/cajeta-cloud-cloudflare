@@ -1,0 +1,69 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.cloud.cloudflare.R2Errors;
+import dev.cajeta.cloud.cloudflare.R2ObjectStore;
+import dev.cajeta.cloud.s3.S3Errors;
+import dev.cajeta.cloud.s3.S3ObjectStore;
+import dev.cajeta.cloud.s3.S3Profile;
+
+/**
+ * R2's error codes as the parent's kinds (spec 3.6, plan 3.1.5). R2 answers
+ * in S3's vocabulary for the codes it shares; the ones pinned here are its
+ * own: TooManyRequests (429) is a retry, not a provider error, and
+ * NotImplemented (501, an S3 feature R2 lacks) is a provider error that names
+ * the feature. The R2 profile carries the differences so the shared store
+ * raises the right kind.
+ */
+public class R2ErrorsTest {
+
+    public R2ErrorsTest() {
+        return;
+    }
+
+    @Test
+    public void r2sOwnCodesDifferFromTheS3Table() {
+        Assert.isTrue(S3Errors.kindOf(429, "TooManyRequests") == CloudException.PROVIDER_ERROR());
+        Assert.isTrue(R2Errors.kindOf(429, "TooManyRequests") == CloudException.TRANSIENT());
+        Assert.isTrue(R2Errors.kindOf(501, "NotImplemented") == CloudException.PROVIDER_ERROR());
+        Assert.isTrue(R2Errors.kindOf(400, "InvalidArgument") == CloudException.PROVIDER_ERROR());
+        // The shared codes keep S3's meaning.
+        Assert.isTrue(R2Errors.kindOf(404, "NoSuchKey") == CloudException.NOT_FOUND());
+        Assert.isTrue(R2Errors.kindOf(403, "AccessDenied") == CloudException.ACCESS_DENIED());
+        Assert.isTrue(R2Errors.kindOf(412, "PreconditionFailed") == CloudException.PRECONDITION_FAILED());
+        Assert.isTrue(R2Errors.kindOf(500, "InternalError") == CloudException.TRANSIENT());
+        return;
+    }
+
+    @Test
+    public void theProfileCarriesTheDifferencesIntoTheStore() {
+        S3Profile p #= R2ObjectStore.profile(false);
+        Assert.isTrue(p.kindFor("TooManyRequests") == CloudException.TRANSIENT());
+        OneReply t = heap OneReply(429, "TooManyRequests", "Too many requests");
+        S3ObjectStore s #= heap S3ObjectStore(t, "assets", 5242880L, p);
+        int32 kind = -1;
+        String message = "";
+        try {
+            int8[] got #= s.get("k");
+        } catch (CloudException e) {
+            kind = e.kind();
+            message = "" + e.message;
+        }
+        Assert.isTrue(kind == CloudException.TRANSIENT());
+        Assert.isTrue(message.indexOf("r2: get") >= 0L);
+        OneReply ni = heap OneReply(501, "NotImplemented", "A header you provided implies functionality that is not implemented");
+        S3ObjectStore s2 #= heap S3ObjectStore(ni, "assets", 5242880L, p);
+        kind = -1;
+        try {
+            String tag #= s2.copy("a", "b");
+        } catch (CloudException e) {
+            kind = e.kind();
+            message = "" + e.message;
+        }
+        Assert.isTrue(kind == CloudException.PROVIDER_ERROR());
+        Assert.isTrue(message.indexOf("NotImplemented") >= 0L);
+        return;
+    }
+}

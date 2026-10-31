@@ -1,0 +1,29 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.cloud.s3.S3Reply;
+import dev.cajeta.cloud.s3.S3Request;
+import dev.cajeta.cloud.s3.S3Transport;
+
+/** A transport answering every request with one S3 error document. */
+public final class OneReply implements S3Transport {
+    int32 status;
+    String code;
+    String message;
+    public int32 calls;
+
+    public OneReply(int32 status, String code, String message) {
+        this.status = status;
+        this.code = "" + code;
+        this.message = "" + message;
+        this.calls = 0;
+        return;
+    }
+
+    public #S3Reply send(S3Request r) {
+        this.calls = this.calls + 1;
+        String doc #= "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>" + this.code
+            + "</Code><Message>" + this.message + "</Message></Error>";
+        return S3Reply.of(this.status, doc);
+    }
+}

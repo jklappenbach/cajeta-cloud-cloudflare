@@ -1,0 +1,71 @@
+# The real-service conformance legs (cajeta-cloud-cloudflare spec §8.2): the
+# object-store suite against a real R2 bucket, and the queue, key-value and
+# Access suites as their adapters land. Opt-in: dispatch only, never on push,
+# because it needs the account's secrets and spends real requests. The
+# account itself is spec Q4; until it exists this workflow has nothing to
+# read and fails on the skip check, by design.
+#
+# Repository secrets it reads:
+#   CLOUDFLARE_ACCOUNT_ID                     the account whose services it tests
+#   R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY    an R2 API token's S3 key pair
+#   CAJETA_R2_TEST_BUCKET                     a bucket the suite may write under
+#                                             cajeta-conformance/<run id>/
+#   R2_JURISDICTION                           optional: eu or fedramp
+#   R2_CONDITIONAL_WRITES                     optional: 1 once spec Q1 is verified,
+#                                             to run the conditional cases too
+#
+# The run fails if a live leg was skipped, so a missing secret cannot pass as
+# green.
+
+name: cloudflare-live
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CAJETA_VERSION: v0.48.0
+
+jobs:
+  live:
+    name: conformance against Cloudflare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout cajeta-cloud-cloudflare
+        uses: actions/checkout@v4
+
+      - name: Install cajeta toolchain (${{ env.CAJETA_VERSION }})
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$CAJETA_VERSION" --repo jklappenbach/cajeta \
+            --pattern 'cajeta_*_amd64.deb' --dir /tmp
+          sudo apt-get update
+          sudo apt-get install -y /tmp/cajeta_*_amd64.deb
+
+      - name: Checkout cajeta-cloud-s3 (sibling, until it is on Olla)
+        uses: actions/checkout@v4
+        with:
+          repository: jklappenbach/cajeta-cloud-s3
+          path: .deps/cajeta-cloud-s3
+
+      - name: Run the suite with the live legs
+        timeout-minutes: 45
+        env:
+          S3_REPO: ${{ github.workspace }}/.deps/cajeta-cloud-s3
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_JURISDICTION: ${{ secrets.R2_JURISDICTION }}
+          R2_CONDITIONAL_WRITES: ${{ secrets.R2_CONDITIONAL_WRITES }}
+          CAJETA_R2_TEST_BUCKET: ${{ secrets.CAJETA_R2_TEST_BUCKET }}
+        run: |
+          set -euo pipefail
+          ./run-tests.sh 2>&1 | tee live.log
+          if grep -E "SKIP .*AgainstARealBucket" live.log; then
+            echo "::error::a live leg was skipped; check the repository secrets"
+            exit 1
+          fi

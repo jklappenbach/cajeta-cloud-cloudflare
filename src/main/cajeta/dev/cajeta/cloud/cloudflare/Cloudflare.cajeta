@@ -1,0 +1,16 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+
+/**
+ * The Cloudflare adapters for `dev.cajeta.cloud`'s ports: R2 behind the object
+ * store (through the shared S3 client), Access as a token verifier, Queues
+ * behind the queue port and Workers KV behind the key-value port.
+ */
+public final class Cloudflare {
+    /** This library's version, the literal of `details.version`; run-tests.sh checks they agree. */
+    public static String version() { return "0.1.0"; }
+
+    /** Archive entry point for `--emit=cja`; does nothing. */
+    public static int32 run() { return 0; }
+}

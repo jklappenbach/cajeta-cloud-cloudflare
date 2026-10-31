@@ -1,0 +1,17 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.error.RecoverableException;
+import cajeta.lang.String;
+
+/**
+ * Startup refused: a value the adapters need is in neither the application's
+ * CloudflareConfig nor the environment, or is not one of the allowed values.
+ * The message names the variable, never a value. A deployment error, not an
+ * operation failure.
+ */
+public class CloudflareConfigurationException extends RecoverableException {
+    public CloudflareConfigurationException(String message) {
+        this.message = "" + message;
+        this.cause = 0;
+    }
+}
