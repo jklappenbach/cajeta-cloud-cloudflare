@@ -1,0 +1,33 @@
+package dev.cajeta.cloud.cloudflare.testkit;
+
+import cajeta.lang.String;
+
+/** One key in FakeKvApi: the value and metadata a reader sees after `visibleAt`, and the ones before it. */
+final class FakeKvEntry {
+    String name;
+    int8[] value;
+    int64 len;
+    String metadata;     // JSON text or ""
+    int64 expiration;    // epoch seconds or 0
+    int64 visibleAt;     // when this write is seen (now + lag)
+    int8[] priorValue;   // what a reader sees before visibleAt; null when the key was absent
+    int64 priorLen;
+    String priorMetadata;
+    int64 priorExpiration;
+    boolean deleted;     // a delete in flight: absent after visibleAt, prior before it
+
+    FakeKvEntry(String name) {
+        this.name = "" + name;
+        this.value = null;
+        this.len = 0L;
+        this.metadata = "" + "";
+        this.expiration = 0L;
+        this.visibleAt = 0L;
+        this.priorValue = null;
+        this.priorLen = 0L;
+        this.priorMetadata = "" + "";
+        this.priorExpiration = 0L;
+        this.deleted = false;
+        return;
+    }
+}

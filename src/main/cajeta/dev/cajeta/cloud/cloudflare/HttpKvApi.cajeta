@@ -1,0 +1,132 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.error.RecoverableException;
+import cajeta.lang.Slice;
+import cajeta.lang.String;
+import cajeta.lang.StringBuilder;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.http.ClientRequest;
+import dev.cajeta.http.ClientResponse;
+import dev.cajeta.http.client.HttpClient;
+
+/**
+ * The Workers KV REST API over cajeta-http (spec 6.2.2):
+ * `https://api.cloudflare.com/client/v4/accounts/<account>/storage/kv/namespaces/<namespace>/<path>`,
+ * a bearer API token scoped to KV. A value with metadata is a multipart
+ * form (`value`, `metadata`), one without is the raw body. A connection
+ * failure is TRANSIENT; every HTTP answer is handed back for KvErrors.
+ */
+public final class HttpKvApi implements KvApi {
+    String base;
+    String token;
+    HttpClient client;
+
+    public HttpKvApi(String accountId, String namespaceId, String apiToken) {
+        this.base #= HttpKvApi.urlFor(accountId, namespaceId, "");
+        this.token = "" + apiToken;
+        this.client = heap HttpClient();
+        return;
+    }
+
+    public static #String urlFor(String accountId, String namespaceId, String path) {
+        return "https://api.cloudflare.com/client/v4/accounts/" + accountId + "/storage/kv/namespaces/"
+            + namespaceId + "/" + path;
+    }
+
+    /** A key as a path segment: unreserved bytes kept, everything else percent-encoded. */
+    public static #String encodeKey(String key) {
+        int32 n = key.byteLength();
+        int8[] out = heap int8[(int64) n * 3L + 1L];
+        int32 o = 0;
+        for (int32 i = 0; i < n; i++) {
+            int32 c = ((int32) key.byteAt(i)) & 0xff;
+            boolean keep = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+                || c == 45 || c == 46 || c == 95 || c == 126;
+            if (keep) {
+                out[o] = (int8) c;
+                o = o + 1;
+            } else {
+                out[o] = (int8) 37;
+                int32 hi = c >> 4;
+                int32 lo = c & 15;
+                out[o + 1] = (int8) (hi < 10 ? 48 + hi : 55 + hi);
+                out[o + 2] = (int8) (lo < 10 ? 48 + lo : 55 + lo);
+                o = o + 3;
+            }
+        }
+        return heap String(#out, o);
+    }
+
+    public #KvReply get(String path, String query) {
+        String url #= this.url(path, query);
+        ClientRequest req #= ClientRequest.get(url);
+        return this.send(req, path);
+    }
+
+    public #KvReply putValue(String path, String query, int8[] value, int64 len, String metadataJson) {
+        String url #= this.url(path, query);
+        ClientRequest req #= ClientRequest.of("PUT", url);
+        if (metadataJson == null) {
+            req.header("Content-Type", "application/octet-stream");
+            req.body(value, (int32) len);
+        } else {
+            String boundary = "cajeta-kv-7f3a9c1e5b2d";
+            StringBuilder head = heap StringBuilder();
+            head.append("--" + boundary + "\r\nContent-Disposition: form-data; name=\"metadata\"\r\n\r\n");
+            head.append(metadataJson);
+            head.append("\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"value\"\r\n\r\n");
+            String tail #= "\r\n--" + boundary + "--\r\n";
+            String headText #= head.toString();
+            int8[] h #= headText.toBytes();
+            int8[] t #= tail.toBytes();
+            int64 total = (int64) h.count() + len + (int64) t.count();
+            int8[] body = heap int8[total < 1L ? 1L : total];
+            int64 o = 0L;
+            for (int64 i = 0L; i < (int64) h.count(); i++) { body[o] = h[i]; o = o + 1L; }
+            for (int64 i = 0L; i < len; i++) { body[o] = value[i]; o = o + 1L; }
+            for (int64 i = 0L; i < (int64) t.count(); i++) { body[o] = t[i]; o = o + 1L; }
+            req.header("Content-Type", "multipart/form-data; boundary=" + boundary);
+            req.body(body, (int32) total);
+        }
+        return this.send(req, path);
+    }
+
+    public #KvReply putJson(String path, String json) {
+        String url #= this.url(path, "");
+        ClientRequest req #= ClientRequest.of("PUT", url);
+        req.header("Content-Type", "application/json");
+        req.body(json);
+        return this.send(req, path);
+    }
+
+    public #KvReply delete(String path, String json) {
+        String url #= this.url(path, "");
+        ClientRequest req #= ClientRequest.of("DELETE", url);
+        if (json != null) {
+            req.header("Content-Type", "application/json");
+            req.body(json);
+        }
+        return this.send(req, path);
+    }
+
+    private #String url(String path, String query) {
+        if (query == null || query.byteLength() == 0) return this.base + path;
+        return this.base + path + "?" + query;
+    }
+
+    private #KvReply send(ClientRequest req, String path) {
+        req.header("Authorization", "Bearer " + this.token);
+        ClientResponse r = null;
+        try {
+            r #= this.client.send(req);
+        } catch (RecoverableException e) {
+            throw heap CloudException(CloudException.TRANSIENT(), "cloudflare", path, "-",
+                "the KV API could not be reached: " + e.message);
+        }
+        Slice<int8> body = r.body();
+        int64 n = body.count();
+        int8[] copy = heap int8[n < 1L ? 1L : n];
+        for (int64 i = 0L; i < n; i++) copy[i] = body[i];
+        return heap KvReply(r.status(), #copy, n);
+    }
+}

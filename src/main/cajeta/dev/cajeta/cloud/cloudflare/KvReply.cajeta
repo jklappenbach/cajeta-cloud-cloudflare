@@ -1,0 +1,33 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+
+/** One KV REST answer: the status and the body bytes (a value, or JSON). */
+public final class KvReply {
+    int32 code;
+    int8[] data;
+    int64 dataLen;
+
+    public KvReply(int32 status, #int8[] body, int64 len) {
+        this.code = status;
+        this.data #= body;
+        this.dataLen = len;
+        return;
+    }
+
+    public static #KvReply of(int32 status, String text) {
+        int8[] b #= text.toBytes();
+        int64 n = (int64) b.count();
+        return heap KvReply(status, #b, n);
+    }
+
+    public int32 status() { return this.code; }
+    public int8[] body() { return this.data; }
+    public int64 bodyLength() { return this.dataLen; }
+
+    public #String text() {
+        int8[] copy = heap int8[this.dataLen < 1L ? 1L : this.dataLen];
+        for (int64 i = 0L; i < this.dataLen; i++) copy[i] = this.data[i];
+        return heap String(#copy, (int32) this.dataLen);
+    }
+}

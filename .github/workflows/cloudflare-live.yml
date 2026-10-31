@@ -13,6 +13,11 @@
 #   R2_JURISDICTION                           optional: eu or fedramp
 #   R2_CONDITIONAL_WRITES                     optional: 1 once spec Q1 is verified,
 #                                             to run the conditional cases too
+#   CLOUDFLARE_API_TOKEN                      a token scoped to the queue (and KV)
+#   CAJETA_QUEUES_TEST_QUEUE_ID               a queue with an HTTP pull consumer the
+#                                             suite may drain
+#   CAJETA_KV_TEST_NAMESPACE_ID               a KV namespace the suite may write under
+#                                             cajeta-conformance/<run id>/
 #
 # The run fails if a live leg was skipped, so a missing secret cannot pass as
 # green.
@@ -70,10 +75,13 @@ jobs:
           R2_JURISDICTION: ${{ secrets.R2_JURISDICTION }}
           R2_CONDITIONAL_WRITES: ${{ secrets.R2_CONDITIONAL_WRITES }}
           CAJETA_R2_TEST_BUCKET: ${{ secrets.CAJETA_R2_TEST_BUCKET }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CAJETA_QUEUES_TEST_QUEUE_ID: ${{ secrets.CAJETA_QUEUES_TEST_QUEUE_ID }}
+          CAJETA_KV_TEST_NAMESPACE_ID: ${{ secrets.CAJETA_KV_TEST_NAMESPACE_ID }}
         run: |
           set -euo pipefail
           ./run-tests.sh 2>&1 | tee live.log
-          if grep -E "SKIP .*AgainstARealBucket" live.log; then
+          if grep -E "SKIP .*(AgainstARealBucket|AgainstARealQueue|AgainstARealNamespace)" live.log; then
             echo "::error::a live leg was skipped; check the repository secrets"
             exit 1
           fi

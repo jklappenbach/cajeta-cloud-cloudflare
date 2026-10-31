@@ -1,0 +1,209 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.Capabilities;
+import dev.cajeta.cloud.Caps;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.cloud.identity.ManualTimeSource;
+import dev.cajeta.cloud.kv.KvEntry;
+import dev.cajeta.cloud.kv.KvListPage;
+import dev.cajeta.cloud.kv.PutOptions;
+import dev.cajeta.cloud.testkit.KeyValueContract;
+import dev.cajeta.cloud.testkit.ManualWaiter;
+import dev.cajeta.cloud.cloudflare.CloudflareKeyValue;
+import dev.cajeta.cloud.cloudflare.HttpKvApi;
+import dev.cajeta.cloud.cloudflare.KvWrite;
+import dev.cajeta.cloud.cloudflare.testkit.FakeKvApi;
+
+/**
+ * Workers KV behind the key-value port (spec 6.2; plan 6.1.1 to 6.1.4) over
+ * FakeKvApi, an in-process stand-in for the KV REST endpoints (write with
+ * metadata and expiry, read value, read metadata, delete, list with a
+ * cursor, bulk write and bulk delete) with an optional propagation lag on a
+ * manual clock. The adapter declares eventual consistency with Cloudflare's
+ * 60-second bound, metadata and expiry, and no conditional writes; bulk
+ * writes and deletes go through the bulk endpoints; KV's limits are refused
+ * by name and a rate limit is retried.
+ */
+public class CloudflareKeyValueTest {
+
+    public CloudflareKeyValueTest() {
+        return;
+    }
+
+    @Test
+    public void theKeyValueContractHoldsOverTheEventualFake() {
+        ManualTimeSource clock = heap ManualTimeSource(1767225600L);
+        FakeKvApi fake = heap FakeKvApi(clock);
+        fake.lag(3L);
+        CloudflareKeyValue kv #= CloudflareKeyValue.over(fake);
+        ManualWaiter w = heap ManualWaiter(clock);
+        KeyValueContract.verify(kv, w, "contract/");
+        Capabilities c = kv.capabilities();
+        String name #= c.adapterName();
+        Assert.equals("cloudflare", name);
+        Assert.isTrue(c.supports(Caps.KV_METADATA()));
+        Assert.isTrue(c.supports(Caps.KV_EXPIRY()));
+        Assert.isFalse(c.supports(Caps.KV_CONDITIONAL_CREATE()));
+        Assert.isFalse(c.supports(Caps.KV_COMPARE_AND_SET()));
+        Assert.isFalse(c.supports(Caps.KV_STRONG_CONSISTENCY()));
+        Assert.isFalse(c.supports(Caps.KV_READ_YOUR_WRITES()));
+        Assert.isTrue(kv.propagationBoundSeconds() == 60L);
+        return;
+    }
+
+    @Test
+    public void aWriteIsStaleWithinTheLagAndFreshAfterIt() {
+        ManualTimeSource clock = heap ManualTimeSource(1767225600L);
+        FakeKvApi fake = heap FakeKvApi(clock);
+        fake.lag(5L);
+        CloudflareKeyValue kv #= CloudflareKeyValue.over(fake);
+        PutOptions o = heap PutOptions();
+        o.metadata("{\"v\":1}");
+        kv.put("k", "one".toBytes(), o);
+        clock.advance(6L);
+        PutOptions o2 = heap PutOptions();
+        o2.metadata("{\"v\":2}");
+        kv.put("k", "two".toBytes(), o2);
+        KvEntry stale #= kv.get("k");
+        Assert.isTrue(stale != null);
+        Assert.equals("one", CloudflareKeyValueTest.text(stale.value()));
+        Assert.equals("{\"v\":1}", stale.metadata());
+        clock.advance(5L);
+        KvEntry fresh #= kv.get("k");
+        Assert.equals("two", CloudflareKeyValueTest.text(fresh.value()));
+        Assert.equals("{\"v\":2}", fresh.metadata());
+        Assert.isTrue(!fresh.version().equals(stale.version()));
+        // An expiry is carried on the entry.
+        PutOptions o3 = heap PutOptions();
+        o3.expiresAt(1767225600L + 100000L);
+        kv.put("exp", "x".toBytes(), o3);
+        clock.advance(5L);
+        KvEntry e #= kv.get("exp");
+        Assert.isTrue(e.expiresAtSeconds() == 1767225600L + 100000L);
+        Assert.isTrue(fake.sent("expiration=1767325600"));
+        return;
+    }
+
+    @Test
+    public void bulkWritesAndDeletesUseTheBulkEndpoints() {
+        ManualTimeSource clock = heap ManualTimeSource(1767225600L);
+        FakeKvApi fake = heap FakeKvApi(clock);
+        CloudflareKeyValue kv #= CloudflareKeyValue.over(fake);
+        ArrayList<KvWrite> writes = heap ArrayList<KvWrite>();
+        for (int32 i = 0; i < 25; i++) {
+            String k #= "bulk/" + i;
+            String v #= "value-" + i;
+            PutOptions o = heap PutOptions();
+            o.metadata("{\"i\":" + i + "}");
+            writes.add(heap KvWrite(k, v.toBytes(), #o));
+        }
+        kv.putAll(writes);
+        Assert.isTrue(fake.calls("PUT bulk") == 1);
+        Assert.isTrue(fake.calls("PUT values/") == 0);
+        Assert.isTrue(fake.sent("\"base64\":true"));
+        KvEntry e #= kv.get("bulk/7");
+        Assert.equals("value-7", CloudflareKeyValueTest.text(e.value()));
+        Assert.equals("{\"i\":7}", e.metadata());
+        KvListPage p #= kv.list("bulk/", null, 100L);
+        Assert.isTrue(p.count() == 25);
+        ArrayList<String> keys = heap ArrayList<String>();
+        for (int32 i = 0; i < 25; i++) {
+            String k #= "bulk/" + i;
+            keys.add(#k);
+        }
+        kv.deleteAll(keys);
+        Assert.isTrue(fake.calls("DELETE bulk") == 1);
+        KvListPage after #= kv.list("bulk/", null, 100L);
+        Assert.isTrue(after.count() == 0);
+        return;
+    }
+
+    @Test
+    public void limitsAreRefusedByNameAndARateLimitIsRetried() {
+        ManualTimeSource clock = heap ManualTimeSource(1767225600L);
+        FakeKvApi fake = heap FakeKvApi(clock);
+        CloudflareKeyValue kv #= CloudflareKeyValue.over(fake);
+        int8[] longKey = heap int8[513L];
+        for (int64 i = 0L; i < 513L; i++) longKey[i] = (int8) 107;
+        String big #= heap String(#longKey, 513);
+        String m1 #= CloudflareKeyValueTest.putFails(kv, big, "v".toBytes(), heap PutOptions());
+        Assert.isTrue(m1.indexOf("512") >= 0L);
+        PutOptions shortTtl = heap PutOptions();
+        shortTtl.timeToLive(30L);
+        String m2 #= CloudflareKeyValueTest.putFails(kv, "k", "v".toBytes(), shortTtl);
+        Assert.isTrue(m2.indexOf("60") >= 0L);
+        int8[] meta = heap int8[1025L];
+        for (int64 i = 0L; i < 1025L; i++) meta[i] = (int8) 109;
+        PutOptions bigMeta = heap PutOptions();
+        String metaText #= heap String(#meta, 1025);
+        bigMeta.metadata(metaText);
+        String m3 #= CloudflareKeyValueTest.putFails(kv, "k", "v".toBytes(), bigMeta);
+        Assert.isTrue(m3.indexOf("1024") >= 0L);
+        Assert.isTrue(fake.calls("PUT values/") == 0);
+        Assert.isTrue(CloudflareKeyValue.MAX_VALUE_BYTES() == 26214400L);
+        // The empty key is refused too.
+        String m4 #= CloudflareKeyValueTest.putFails(kv, "", "v".toBytes(), heap PutOptions());
+        Assert.isTrue(m4.indexOf("empty") >= 0L);
+        // One 429 (the per-key write rate) is retried and counted.
+        fake.rateLimitNext(1);
+        kv.put("k", "v".toBytes(), heap PutOptions());
+        Assert.isTrue(kv.stats().retries() == 1L);
+        Assert.isTrue(fake.calls("PUT values/") == 2);
+        fake.rateLimitNext(100);
+        int32 kind = -1;
+        try {
+            kv.put("k", "v".toBytes(), heap PutOptions());
+        } catch (CloudException e) {
+            kind = e.kind();
+        }
+        Assert.isTrue(kind == CloudException.TRANSIENT());
+        fake.rateLimitNext(0);
+        // Conditional writes refuse by name, before any request.
+        int32 before = fake.calls("PUT values/");
+        kind = -1;
+        String message = "";
+        try {
+            kv.putIfAbsent("k", "v".toBytes(), heap PutOptions());
+        } catch (CloudException e) {
+            kind = e.kind();
+            message = "" + e.message;
+        }
+        Assert.isTrue(kind == CloudException.PROVIDER_ERROR());
+        Assert.isTrue(message.indexOf("kv.conditional-create") >= 0L);
+        Assert.isTrue(fake.calls("PUT values/") == before);
+        return;
+    }
+
+    @Test
+    public void theRestUrlsEncodeTheKey() {
+        String url #= HttpKvApi.urlFor("0123456789abcdef", "ns-1", "values/a%2Fb");
+        Assert.equals("https://api.cloudflare.com/client/v4/accounts/0123456789abcdef/storage/kv/namespaces/ns-1/values/a%2Fb", url);
+        String enc #= HttpKvApi.encodeKey("a/b c?d=é");
+        Assert.equals("a%2Fb%20c%3Fd%3D%C3%A9", enc);
+        String plain #= HttpKvApi.encodeKey("user:42_ok-key.v1~x");
+        Assert.equals("user%3A42_ok-key.v1~x", plain);
+        return;
+    }
+
+    static #String putFails(CloudflareKeyValue kv, String key, int8[] value, PutOptions o) {
+        String message #= "" + "";
+        int32 kind = -1;
+        try {
+            kv.put(key, value, o);
+        } catch (CloudException e) {
+            message #= "" + e.message;
+            kind = e.kind();
+        }
+        Assert.isTrue(kind == CloudException.PROVIDER_ERROR());
+        return #message;
+    }
+
+    static #String text(int8[] b) {
+        int8[] copy = heap int8[(int64) b.count()];
+        for (int64 i = 0L; i < (int64) copy.count(); i++) copy[i] = b[i];
+        return heap String(#copy, (int32) b.count());
+    }
+}

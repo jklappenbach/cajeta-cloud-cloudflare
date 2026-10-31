@@ -7,8 +7,8 @@ ports, written in Cajeta:
 |---|---|---|
 | object store | R2 through the shared S3 client, [cajeta-cloud-s3](https://github.com/jklappenbach/cajeta-cloud-s3) | `R2ObjectStore.connect(bucket, config)` |
 | identity (`TokenVerifier`) | Cloudflare Access application tokens; every other identity operation refuses | `IDENTITY_PROVIDER=access` |
-| queue | Cloudflare Queues (pull consumers) | planned |
-| key-value | Workers KV | planned |
+| queue (`MessageQueue`) | Cloudflare Queues through the REST API and an HTTP pull consumer; the receipt is the lease id | `QUEUE_PROVIDER=cloudflare` |
+| key-value (`KeyValueStore`) | Workers KV through the REST API, eventual with a 60 s bound, no conditional writes | `KV_PROVIDER=cloudflare` |
 
 Configuration comes from a `CloudflareConfig` component first, then the
 environment: `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` (the REST APIs),
@@ -43,6 +43,20 @@ into the port's claims with the subject, email and forwarded groups. It takes
 registration, sign-in and every other identity operation as unsupported.
 The skill `cloudflare-access-identity` covers it.
 
+The `cloudflare` queue adapter sends through the Queues REST API and
+receives through an HTTP pull consumer; messages travel in the port's JSON
+envelope so attributes round-trip, acks and retries batch what the caller
+batched, Cloudflare's limits are refused by name and a rate limit is
+retried. It reads `CLOUDFLARE_QUEUE_ID` and the queues token of the chain.
+The skill `cloudflare-queues` covers it.
+
+The `cloudflare` key-value adapter writes, reads, lists and deletes through
+the Workers KV REST API with metadata and expiry, adds `putAll` and
+`deleteAll` through the bulk endpoints, declares eventual consistency with
+Cloudflare's 60-second bound and no conditional writes, refuses KV's limits
+by name and retries a rate limit. It reads `CLOUDFLARE_KV_NAMESPACE_ID` and
+the kv token of the chain. The skill `cloudflare-workers-kv` covers it.
+
 **Status: in development (0.1.0 unreleased).** The spec and plan are
 `cajeta-cloud-cloudflare` in the cajeta repository's `specs/` and `agents/`.
 
@@ -55,7 +69,9 @@ The skill `cloudflare-access-identity` covers it.
 The suite needs no Cloudflare account: R2 runs against `FakeS3` from
 cajeta-cloud-s3 with R2's part rule enforced, and the object-store
 conformance suite runs over it under both profiles; Access runs against a
-fixture certificate set and tokens signed by it. The same suite runs
+fixture certificate set and tokens signed by it; Queues against an in-process
+REST API with leases on a manual clock; KV against one with a propagation
+lag. The same suite runs
 against a real bucket when `CAJETA_R2_TEST_BUCKET` is set, with the chain's
 variables; `cloudflare-live.yml` does that on dispatch and fails if the live
 leg skips. Dependency archives resolve from `~/.olla` or Olla at the versions

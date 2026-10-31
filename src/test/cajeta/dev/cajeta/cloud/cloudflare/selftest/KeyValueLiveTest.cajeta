@@ -1,0 +1,40 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Skip;
+import dev.cajeta.cloud.testkit.KeyValueContract;
+import dev.cajeta.cloud.testkit.RealWaiter;
+import dev.cajeta.cloud.cloudflare.CloudflareChain;
+import dev.cajeta.cloud.cloudflare.CloudflareKeyValue;
+import dev.cajeta.cloud.cloudflare.HttpKvApi;
+
+/**
+ * The key-value conformance suite against a real Workers KV namespace (spec
+ * 6.2.5, 8.2; plan 6.3.1), opt-in through CAJETA_KV_TEST_NAMESPACE_ID with
+ * the chain's account id and kv token in the environment. On the wall clock,
+ * so the eventual cases wait out KV's 60-second propagation bound; keys go
+ * under a run-unique prefix (spec 8.3).
+ */
+public class KeyValueLiveTest {
+
+    public KeyValueLiveTest() {
+        return;
+    }
+
+    @Test
+    public void theKeyValueContractHoldsAgainstARealNamespace() {
+        String ns #= System.env.get("CAJETA_KV_TEST_NAMESPACE_ID");
+        if (ns == null || ns.byteLength() == 0) {
+            Skip.because("CAJETA_KV_TEST_NAMESPACE_ID is not set; no Workers KV namespace to test against");
+        }
+        String account #= CloudflareChain.accountId(null);
+        String token #= CloudflareChain.apiToken(null, "kv");
+        HttpKvApi api = heap HttpKvApi(account, ns, token);
+        CloudflareKeyValue kv #= CloudflareKeyValue.over(api);
+        RealWaiter w = heap RealWaiter();
+        String run #= System.env.get("GITHUB_RUN_ID");
+        String prefix #= "cajeta-conformance/" + (run == null ? "local" : run) + "/";
+        KeyValueContract.verify(kv, w, prefix);
+        return;
+    }
+}

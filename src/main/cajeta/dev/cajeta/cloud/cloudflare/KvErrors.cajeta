@@ -1,0 +1,76 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonParseException;
+import cajeta.codec.json.JsonValue;
+import cajeta.lang.String;
+import dev.cajeta.cloud.CloudException;
+
+/**
+ * Workers KV REST errors as the parent's kinds (spec 6.2.4, parent §11.1):
+ * a rate limit (429, the per-key write rate of one a second among them) is
+ * TRANSIENT, as is a 5xx; 401 and 403 are ACCESS_DENIED; 404 is NOT_FOUND;
+ * a size or TTL limit the API names is a PROVIDER_ERROR naming it; the
+ * rest are PROVIDER_ERROR with the API's own message. The limits the
+ * adapter refuses before a request are here too.
+ */
+public final class KvErrors {
+
+    public static int64 MAX_KEY_BYTES() { return 512L; }
+    public static int64 MAX_VALUE_BYTES() { return 26214400L; }
+    public static int64 MAX_METADATA_BYTES() { return 1024L; }
+    public static int64 MIN_TTL_SECONDS() { return 60L; }
+    public static int32 MAX_BULK() { return 10000; }
+    public static int64 PROPAGATION_BOUND_SECONDS() { return 60L; }
+
+    /** The exception for an error answer; `key` names the key or "-". */
+    public static #CloudException of(KvReply r, String operation, String key) {
+        int32 status = r.status();
+        int32 code = 0;
+        String message #= "" + "";
+        try {
+            String text #= r.text();
+            JsonValue root #= Json.parse(text);
+            if (root.kind() == JsonValue.OBJECT) {
+                JsonValue errs = root.object().get("errors");
+                if (errs != null && errs.kind() == JsonValue.ARRAY && errs.array().count() > 0) {
+                    JsonValue first = errs.array().get(0);
+                    if (first.kind() == JsonValue.OBJECT) {
+                        JsonObject fo = first.object();
+                        JsonValue c = fo.get("code");
+                        if (c != null && c.kind() == JsonValue.NUMBER) code = c.asInt32();
+                        JsonValue m = fo.get("message");
+                        if (m != null && m.kind() == JsonValue.STRING) message #= QueuesJson.text(m);
+                    }
+                }
+            }
+        } catch (JsonParseException e) {
+            message #= "" + "";
+        }
+        if (message.byteLength() == 0) message #= "the KV API answered HTTP " + status;
+        String lower #= message.toLowerCase();
+        int32 kind = CloudException.PROVIDER_ERROR();
+        String detail #= "" + message;
+        if (status == 429) {
+            kind = CloudException.TRANSIENT();
+            detail #= "rate limited by the KV API (one write a second a key): " + message;
+        } else if (status >= 500) {
+            kind = CloudException.TRANSIENT();
+        } else if (status == 401 || status == 403) {
+            kind = CloudException.ACCESS_DENIED();
+        } else if (status == 404 || lower.indexOf("not found") >= 0L) {
+            kind = CloudException.NOT_FOUND();
+        } else if (status == 413 || lower.indexOf("too large") >= 0L || lower.indexOf("exceeds") >= 0L
+                || lower.indexOf("expiration_ttl") >= 0L) {
+            detail #= "over a Workers KV limit (512 B a key, 25 MiB a value, 1024 B of metadata, a TTL of 60 s or more): " + message;
+        }
+        if (code != 0) detail #= detail + " (code " + code + ")";
+        return heap CloudException(kind, "cloudflare", operation, key, detail);
+    }
+
+    /** A client-side refusal of something over a documented limit, before any request. */
+    public static #CloudException limit(String operation, String key, String what) {
+        return heap CloudException(CloudException.PROVIDER_ERROR(), "cloudflare", operation, key, what);
+    }
+}

@@ -1,0 +1,441 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.codec.Base64;
+import cajeta.codec.Base64Exception;
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonArray;
+import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonParseException;
+import cajeta.codec.json.JsonValue;
+import cajeta.collection.ArrayList;
+import cajeta.concurrent.Fiber;
+import cajeta.lang.String;
+import cajeta.lang.StringBuilder;
+import cajeta.time.Duration;
+import dev.cajeta.cloud.Capabilities;
+import dev.cajeta.cloud.Caps;
+import dev.cajeta.cloud.CloudException;
+import dev.cajeta.cloud.CloudStats;
+import dev.cajeta.cloud.RetryPolicy;
+import dev.cajeta.cloud.identity.SystemTimeSource;
+import dev.cajeta.cloud.identity.TimeSource;
+import dev.cajeta.cloud.kv.KeyValueStore;
+import dev.cajeta.cloud.kv.KvCondResult;
+import dev.cajeta.cloud.kv.KvEntry;
+import dev.cajeta.cloud.kv.KvListPage;
+import dev.cajeta.cloud.kv.PutOptions;
+
+/**
+ * Workers KV behind the key-value port (spec 6.2): writes with metadata and
+ * expiry (absolute or TTL), reads of value and metadata, delete, prefix
+ * listing behind KV's cursor, and `putAll` / `deleteAll` through the bulk
+ * endpoints. Declares `kv.metadata`, `kv.expiry` and eventual consistency
+ * with Cloudflare's documented 60-second propagation bound; not conditional
+ * writes (KV has none; `putIfAbsent` and `compareAndSet` refuse per parent
+ * §3.2), not strong consistency, not read-your-writes. KV has no version,
+ * so an entry's version is derived from its bytes. KV's limits are refused
+ * by name before a request (512 B a key, 25 MiB a value, 1024 B of
+ * metadata, a TTL of 60 s or more, 10,000 pairs a bulk call); a rate limit
+ * is TRANSIENT and retried under RetryPolicy.
+ *
+ * As the `cloudflare` component it configures itself on first use from
+ * CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_KV_NAMESPACE_ID and the kv token of the
+ * chain (CLOUDFLARE_KV_API_TOKEN, else CLOUDFLARE_API_TOKEN).
+ */
+@Component(name = "cloudflare")
+public final class CloudflareKeyValue implements KeyValueStore {
+    KvApi api;
+    TimeSource clock;
+    Capabilities caps;
+    CloudStats statsObj;
+    RetryPolicy retry;
+    boolean ready;
+
+    /** The `cloudflare` component: configured from the environment on first use. */
+    public CloudflareKeyValue() {
+        this.ready = false;
+        this.statsObj = heap CloudStats();
+        this.retry #= RetryPolicy.standard((uint64) 11);
+        this.caps #= CloudflareKeyValue.capabilitiesFor();
+        this.clock = heap SystemTimeSource();
+        return;
+    }
+
+    public static int64 MAX_VALUE_BYTES() { return KvErrors.MAX_VALUE_BYTES(); }
+
+    /** A store over the given API. */
+    public static #CloudflareKeyValue over(KvApi api) {
+        CloudflareKeyValue kv = heap CloudflareKeyValue();
+        kv.api #= api;
+        kv.ready = true;
+        return #kv;
+    }
+
+    static #Capabilities capabilitiesFor() {
+        Capabilities c = heap Capabilities("cloudflare");
+        c.declare(Caps.KV_METADATA(), "JSON up to 1024 bytes a key");
+        c.declare(Caps.KV_EXPIRY(), "an absolute expiration or a TTL of 60 s or more");
+        return #c;
+    }
+
+    private void ensure() {
+        if (this.ready) return;
+        String account #= CloudflareChain.accountId(null);
+        String token #= CloudflareChain.apiToken(null, "kv");
+        String ns #= CloudflareChain.env("CLOUDFLARE_KV_NAMESPACE_ID");
+        if (ns == null) {
+            throw heap CloudflareConfigurationException("no Workers KV namespace: CLOUDFLARE_KV_NAMESPACE_ID is not set");
+        }
+        this.api = heap HttpKvApi(account, ns, token);
+        this.ready = true;
+    }
+
+    public Capabilities capabilities() { return this.caps; }
+    public CloudStats stats() { return this.statsObj; }
+    public int64 propagationBoundSeconds() { return KvErrors.PROPAGATION_BOUND_SECONDS(); }
+
+    public void put(String key, int8[] value, PutOptions options) {
+        this.ensure();
+        CloudflareKeyValue.checkWrite(key, value, options, "put");
+        String path #= "values/" + HttpKvApi.encodeKey(key);
+        String query #= CloudflareKeyValue.expiryQuery(options);
+        String meta #= CloudflareKeyValue.metadataOrNull(options);
+        int32 attempt = 0;
+        while (true) {
+            KvReply r #= this.api.putValue(path, query, value, (int64) value.count(), meta);
+            this.account(r, (int64) value.count());
+            if (CloudflareKeyValue.ok(r)) return;
+            CloudException e #= KvErrors.of(r, "put", key);
+            if (!this.retryable(e, attempt)) throw e;
+            attempt = attempt + 1;
+        }
+    }
+
+    public #KvEntry get(String key) {
+        this.ensure();
+        String enc #= HttpKvApi.encodeKey(key);
+        // The listing names the key's expiration and metadata; the value is its own read.
+        String metaPath #= "keys";
+        String q #= "prefix=" + enc + "&limit=1";
+        JsonValue listed #= this.json(this.call0("GET", metaPath, q, null), "get", key);
+        String metadata #= "" + "";
+        int64 expires = 0L;
+        boolean named = false;
+        if (listed.kind() == JsonValue.OBJECT) {
+            JsonValue res = listed.object().get("result");
+            if (res != null && res.kind() == JsonValue.ARRAY && res.array().count() > 0) {
+                JsonValue first = res.array().get(0);
+                if (first.kind() == JsonValue.OBJECT) {
+                    JsonObject fo = first.object();
+                    String name #= QueuesJson.textOf(fo, "name");
+                    if (name.equals(key)) {
+                        named = true;
+                        expires = QueuesJson.numberOf(fo, "expiration");
+                        JsonValue m = fo.get("metadata");
+                        if (m != null && m.kind() == JsonValue.STRING) metadata #= QueuesJson.text(m);
+                        else if (m != null && !m.isNull()) metadata #= QueuesJson.stringify(m);
+                    }
+                }
+            }
+        }
+        if (!named) return null;
+        String path #= "values/" + enc;
+        KvReply r #= this.call0("GET", path, "", null);
+        if (r.status() == 404) return null;
+        if (!CloudflareKeyValue.ok(r)) {
+            CloudException e #= KvErrors.of(r, "get", key);
+            if (e.kind() == CloudException.NOT_FOUND()) return null;
+            throw e;
+        }
+        int64 n = r.bodyLength();
+        int8[] value = heap int8[n < 1L ? 1L : n];
+        int8[] src = r.body();
+        for (int64 i = 0L; i < n; i++) value[i] = src[i];
+        if (n == 0L) value = heap int8[0L];
+        String version #= CloudflareKeyValue.versionOf(src, n);
+        return heap KvEntry(#value, metadata, version, expires);
+    }
+
+    public boolean delete(String key) {
+        this.ensure();
+        String path #= "values/" + HttpKvApi.encodeKey(key);
+        KvReply r #= this.call0("DELETE", path, "", null);
+        if (CloudflareKeyValue.ok(r)) return true;
+        CloudException e #= KvErrors.of(r, "delete", key);
+        if (e.kind() == CloudException.NOT_FOUND()) return false;
+        throw e;
+    }
+
+    public #KvListPage list(String prefix, String cursor, int64 limit) {
+        this.ensure();
+        // KV lists at least 10 keys a page. A smaller limit is paged here: the
+        // keys past the limit ride in the cursor (`l:<base64 json>:<server cursor>`)
+        // and are served before the server is asked again; a bare server cursor
+        // is `s:<cursor>`; "" is the end.
+        ArrayList<String> leftover = heap ArrayList<String>();
+        String server #= "" + "";
+        if (cursor != null && cursor.indexOf("l:") == 0L) {
+            int64 colon = cursor.indexOfFrom(":", 2L);
+            String b64 #= cursor.substring(2, (int32) colon);
+            server #= cursor.substring((int32) (colon + 1L), cursor.byteLength());
+            CloudflareKeyValue.decodeNames(b64, leftover);
+        } else if (cursor != null && cursor.indexOf("s:") == 0L) {
+            server #= cursor.substring(2, cursor.byteLength());
+        }
+        ArrayList<String> names = heap ArrayList<String>();
+        while (leftover.count() > 0 && (limit <= 0L || (int64) names.count() < limit)) {
+            String first #= leftover.removeAt(0);
+            names.add(#first);
+        }
+        if (leftover.count() == 0 && (limit <= 0L || (int64) names.count() < limit)
+                && (names.count() == 0 || server.byteLength() > 0)) {
+            StringBuilder q = heap StringBuilder();
+            String encPrefix #= HttpKvApi.encodeKey(prefix == null ? "" : prefix);
+            q.append("prefix=" + encPrefix);
+            int64 ask = limit <= 0L ? 1000L : (limit < 10L ? 10L : limit);
+            q.append("&limit=" + ask);
+            if (server.byteLength() > 0) q.append("&cursor=" + server);
+            String query #= q.toString();
+            JsonValue root #= this.json(this.call0("GET", "keys", query, null), "list", prefix);
+            server #= "" + "";
+            if (root.kind() == JsonValue.OBJECT) {
+                JsonValue res = root.object().get("result");
+                if (res != null && res.kind() == JsonValue.ARRAY) {
+                    JsonArray arr = res.array();
+                    for (int32 i = 0; i < arr.count(); i++) {
+                        JsonValue k = arr.get(i);
+                        if (k.kind() != JsonValue.OBJECT) continue;
+                        String name #= QueuesJson.textOf(k.object(), "name");
+                        if (limit <= 0L || (int64) names.count() < limit) names.add(#name);
+                        else leftover.add(#name);
+                    }
+                }
+                JsonValue info = root.object().get("result_info");
+                if (info != null && info.kind() == JsonValue.OBJECT) {
+                    server #= QueuesJson.textOf(info.object(), "cursor");
+                }
+            }
+        }
+        int32 n = names.count();
+        String[] keys = heap String[(int64) n];
+        for (int32 i = 0; i < n; i++) keys[i] #= "" + names.get(i);
+        String next #= "" + "";
+        if (leftover.count() > 0) {
+            String b64 #= CloudflareKeyValue.encodeNames(leftover);
+            next #= "l:" + b64 + ":" + server;
+        } else if (server.byteLength() > 0) {
+            next #= "s:" + server;
+        }
+        return heap KvListPage(#keys, #next);
+    }
+
+    static #String encodeNames(ArrayList<String> names) {
+        StringBuilder sb = heap StringBuilder();
+        sb.append("[");
+        for (int32 i = 0; i < names.count(); i++) {
+            if (i > 0) sb.append(",");
+            String q #= QueuesJson.quote(names.get(i));
+            sb.append(q);
+        }
+        sb.append("]");
+        String json #= sb.toString();
+        int8[] b #= json.toBytes();
+        return Base64.encodeUrlSafe(b, (int64) b.count());
+    }
+
+    static void decodeNames(String b64, ArrayList<String> into) {
+        try {
+            int8[] bytes #= Base64.decode(b64);
+            JsonValue root #= Json.parse(bytes, (int64) bytes.count());
+            if (root.kind() == JsonValue.ARRAY) {
+                JsonArray arr = root.array();
+                for (int32 i = 0; i < arr.count(); i++) {
+                    JsonValue v = arr.get(i);
+                    if (v.kind() != JsonValue.STRING) continue;
+                    String name #= QueuesJson.text(v);
+                    into.add(#name);
+                }
+            }
+        } catch (JsonParseException e) {
+            return;
+        } catch (Base64Exception e) {
+            return;
+        }
+        return;
+    }
+
+    public #KvCondResult putIfAbsent(String key, int8[] value, PutOptions options) {
+        this.caps.require(Caps.KV_CONDITIONAL_CREATE(), "putIfAbsent", key);
+        return null;
+    }
+
+    public #KvCondResult compareAndSet(String key, String expectedVersion, int8[] value, PutOptions options) {
+        this.caps.require(Caps.KV_COMPARE_AND_SET(), "compareAndSet", key);
+        return null;
+    }
+
+    /** Writes every entry through the bulk endpoint, 10,000 a call. */
+    public void putAll(ArrayList<KvWrite> writes) {
+        this.ensure();
+        int32 n = writes.count();
+        int32 at = 0;
+        while (at < n) {
+            int32 end = at + KvErrors.MAX_BULK();
+            if (end > n) end = n;
+            StringBuilder sb = heap StringBuilder();
+            sb.append("[");
+            for (int32 i = at; i < end; i++) {
+                KvWrite w = writes.get(i);
+                CloudflareKeyValue.checkWrite(w.key(), w.value(), w.options(), "putAll");
+                if (i > at) sb.append(",");
+                sb.append("{\"key\":");
+                String k #= QueuesJson.quote(w.key());
+                sb.append(k);
+                sb.append(",\"value\":\"");
+                String b64 #= Base64.encode(w.value(), (int64) w.value().count());
+                sb.append(b64);
+                sb.append("\",\"base64\":true");
+                String meta #= CloudflareKeyValue.metadataOrNull(w.options());
+                if (meta != null) {
+                    sb.append(",\"metadata\":");
+                    sb.append(meta);
+                }
+                int64 exp = w.options() == null ? 0L : w.options().expiryAt(this.clock.nowSeconds());
+                if (exp > 0L) {
+                    sb.append(",\"expiration\":" + exp);
+                }
+                sb.append("}");
+            }
+            sb.append("]");
+            String json #= sb.toString();
+            KvReply r #= this.call0("PUT", "bulk", "", json);
+            if (!CloudflareKeyValue.ok(r)) throw KvErrors.of(r, "putAll", "-");
+            at = end;
+        }
+        return;
+    }
+
+    /** Deletes every key through the bulk endpoint, 10,000 a call. */
+    public void deleteAll(ArrayList<String> keys) {
+        this.ensure();
+        int32 n = keys.count();
+        int32 at = 0;
+        while (at < n) {
+            int32 end = at + KvErrors.MAX_BULK();
+            if (end > n) end = n;
+            StringBuilder sb = heap StringBuilder();
+            sb.append("[");
+            for (int32 i = at; i < end; i++) {
+                if (i > at) sb.append(",");
+                String k #= QueuesJson.quote(keys.get(i));
+                sb.append(k);
+            }
+            sb.append("]");
+            String json #= sb.toString();
+            KvReply r #= this.call0("DELETE", "bulk", "", json);
+            if (!CloudflareKeyValue.ok(r)) throw KvErrors.of(r, "deleteAll", "-");
+            at = end;
+        }
+        return;
+    }
+
+    static void checkWrite(String key, int8[] value, PutOptions options, String operation) {
+        if (key == null || key.byteLength() == 0) {
+            throw KvErrors.limit(operation, "-", "the key is empty; Workers KV keys are 1 to 512 bytes");
+        }
+        if ((int64) key.byteLength() > KvErrors.MAX_KEY_BYTES()) {
+            throw KvErrors.limit(operation, key, "a key of " + key.byteLength() + " bytes is over the Workers KV limit of "
+                + KvErrors.MAX_KEY_BYTES() + " bytes");
+        }
+        if ((int64) value.count() > KvErrors.MAX_VALUE_BYTES()) {
+            throw KvErrors.limit(operation, key, "a value of " + value.count() + " bytes is over the Workers KV limit of "
+                + KvErrors.MAX_VALUE_BYTES() + " bytes (25 MiB)");
+        }
+        if (options != null) {
+            String m = options.metadata();
+            if (m != null && (int64) m.byteLength() > KvErrors.MAX_METADATA_BYTES()) {
+                throw KvErrors.limit(operation, key, "metadata of " + m.byteLength() + " bytes is over the Workers KV limit of "
+                    + KvErrors.MAX_METADATA_BYTES() + " bytes");
+            }
+            if (options.ttlSeconds() > 0L && options.ttlSeconds() < KvErrors.MIN_TTL_SECONDS()) {
+                throw KvErrors.limit(operation, key, "a time to live of " + options.ttlSeconds()
+                    + " s is under the Workers KV minimum of " + KvErrors.MIN_TTL_SECONDS() + " s");
+            }
+        }
+        return;
+    }
+
+    static #String expiryQuery(PutOptions options) {
+        if (options == null) return "" + "";
+        if (options.ttlSeconds() > 0L) return "expiration_ttl=" + options.ttlSeconds();
+        if (options.expiryEpochSeconds() > 0L) return "expiration=" + options.expiryEpochSeconds();
+        return "" + "";
+    }
+
+    // The port's metadata is an opaque string; KV's is a JSON value. It travels
+    // as a JSON string literal and comes back as the same string.
+    static #String metadataOrNull(PutOptions options) {
+        if (options == null) return null;
+        String m = options.metadata();
+        if (m == null || m.byteLength() == 0) return null;
+        return QueuesJson.quote(m);
+    }
+
+    // A content-derived version: KV has none of its own. Multiplication stays
+    // under 2^37, so it cannot trap.
+    static #String versionOf(int8[] b, int64 n) {
+        int64 h = 2166136261L;
+        for (int64 i = 0L; i < n; i++) {
+            h = ((h ^ (((int64) b[i]) & 255L)) * 31L) & 4294967295L;
+        }
+        return "x" + h + "-" + n;
+    }
+
+    static boolean ok(KvReply r) {
+        return r.status() >= 200 && r.status() < 300;
+    }
+
+    // One call under the retry policy; the reply is handed back whatever its status.
+    private #KvReply call0(String method, String path, String query, String json) {
+        int32 attempt = 0;
+        while (true) {
+            KvReply r = null;
+            if (method.equals("GET")) r #= this.api.get(path, query);
+            else if (method.equals("PUT")) r #= this.api.putJson(path, json);
+            else r #= this.api.delete(path, json);
+            this.account(r, json == null ? 0L : (int64) json.byteLength());
+            if (r.status() != 429 && r.status() < 500) return #r;
+            CloudException e #= KvErrors.of(r, path, "-");
+            if (!this.retryable(e, attempt)) throw e;
+            attempt = attempt + 1;
+        }
+    }
+
+    // Parses a JSON reply, raising the API's error for a failed one.
+    private #JsonValue json(#KvReply r, String operation, String key) {
+        if (!CloudflareKeyValue.ok(r)) throw KvErrors.of(r, operation, key);
+        try {
+            String text #= r.text();
+            return Json.parse(text);
+        } catch (JsonParseException e) {
+            throw heap CloudException(CloudException.PROVIDER_ERROR(), "cloudflare", operation, key,
+                "the KV API answered HTTP " + r.status() + " with a body that is not JSON");
+        }
+    }
+
+    // True after waiting out the policy's delay for a retryable failure; false
+    // when the caller should raise `e` (which the caller owns).
+    private boolean retryable(CloudException e, int32 attempt) {
+        if (!this.retry.shouldRetry(e, attempt)) return false;
+        this.statsObj.recordRetry();
+        int64 ms = this.retry.delayMillis(attempt);
+        Fiber.sleep(Duration.ofMillis(ms));
+        return true;
+    }
+
+    private void account(KvReply r, int64 bytesOut) {
+        boolean failed = !CloudflareKeyValue.ok(r);
+        this.statsObj.recordCall(0L, r.bodyLength(), bytesOut, failed);
+        return;
+    }
+}

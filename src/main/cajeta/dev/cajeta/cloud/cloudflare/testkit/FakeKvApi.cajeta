@@ -1,0 +1,434 @@
+package dev.cajeta.cloud.cloudflare.testkit;
+
+import cajeta.codec.Base64;
+import cajeta.codec.Base64Exception;
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonArray;
+import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonParseException;
+import cajeta.codec.json.JsonValue;
+import cajeta.collection.ArrayList;
+import cajeta.concurrent.Lock;
+import cajeta.concurrent.LockGuard;
+import cajeta.lang.String;
+import cajeta.lang.StringBuilder;
+import dev.cajeta.cloud.identity.TimeSource;
+import dev.cajeta.cloud.cloudflare.KvApi;
+import dev.cajeta.cloud.cloudflare.KvReply;
+import dev.cajeta.cloud.cloudflare.QueuesJson;
+
+/**
+ * An in-process Workers KV REST API (spec 8.1, plan 6.1.1): write with
+ * metadata and expiry (absolute and TTL), read value, list keys with
+ * prefix, limit and cursor (the metadata and expiration on each), delete,
+ * bulk write and bulk delete, in the shapes the API reference documents, on
+ * a TimeSource. `lag(seconds)` makes every write and delete visible that
+ * many seconds later, with the prior state read until then, so the eventual
+ * model is exercised. `rateLimitNext(n)` answers the next n calls 429. It
+ * logs every call as `METHOD path`.
+ */
+public final class FakeKvApi implements KvApi {
+    Lock lock;
+    TimeSource clock;
+    ArrayList<FakeKvEntry> entries;   // sorted by name
+    int64 lagSeconds;
+    int32 rateLimits;
+    ArrayList<String> log;
+    ArrayList<String> bodies;
+
+    public FakeKvApi(^TimeSource clock) {
+        this.lock = heap Lock();
+        this.clock = clock;
+        this.entries = heap ArrayList<FakeKvEntry>();
+        this.lagSeconds = 0L;
+        this.rateLimits = 0;
+        this.log = heap ArrayList<String>();
+        this.bodies = heap ArrayList<String>();
+        return;
+    }
+
+    public void lag(int64 seconds) { this.lagSeconds = seconds; return; }
+    public void rateLimitNext(int32 n) { this.rateLimits = n; return; }
+
+    /** How many logged calls start with `prefix` (`"PUT values/"`, `"DELETE bulk"`, ...). */
+    public int32 calls(String prefix) {
+        int32 n = 0;
+        for (int32 i = 0; i < this.log.count(); i++) {
+            if (this.log.get(i).indexOf(prefix) == 0L) n = n + 1;
+        }
+        return n;
+    }
+
+    /** True when some call's path, query or body contains `text`. */
+    public boolean sent(String text) {
+        for (int32 i = 0; i < this.bodies.count(); i++) {
+            if (this.bodies.get(i).indexOf(text) >= 0L) return true;
+        }
+        for (int32 i = 0; i < this.log.count(); i++) {
+            if (this.log.get(i).indexOf(text) >= 0L) return true;
+        }
+        return false;
+    }
+
+    public #KvReply get(String path, String query) {
+        LockGuard g #= this.lock.acquire();
+        this.note("GET " + path + (query.byteLength() > 0 ? "?" + query : ""), "");
+        if (this.limited()) return FakeKvApi.error(429, 10000, "Rate limited");
+        if (path.equals("keys")) return this.listKeys(query);
+        if (path.indexOf("values/") == 0L) {
+            String key #= FakeKvApi.decode(path.substring(7, path.byteLength()));
+            int32 at = this.find(key);
+            if (at < 0) return FakeKvApi.error(404, 10009, "get: 'key not found'");
+            FakeKvEntry e = this.entries.get(at);
+            int64 now = this.clock.nowSeconds();
+            if (!this.present(e, now)) return FakeKvApi.error(404, 10009, "get: 'key not found'");
+            int8[] src = this.seenValue(e, now);
+            int64 n = this.seenLen(e, now);
+            int8[] copy = heap int8[n < 1L ? 1L : n];
+            for (int64 i = 0L; i < n; i++) copy[i] = src[i];
+            return heap KvReply(200, #copy, n);
+        }
+        if (path.indexOf("metadata/") == 0L) {
+            String key #= FakeKvApi.decode(path.substring(9, path.byteLength()));
+            int32 at = this.find(key);
+            int64 now = this.clock.nowSeconds();
+            if (at < 0 || !this.present(this.entries.get(at), now)) return FakeKvApi.error(404, 10009, "get: 'key not found'");
+            String m #= this.seenMetadata(this.entries.get(at), now);
+            return FakeKvApi.ok(m.byteLength() == 0 ? "null" : m);
+        }
+        return FakeKvApi.error(404, 7000, "No route for that URI");
+    }
+
+    public #KvReply putValue(String path, String query, int8[] value, int64 len, String metadataJson) {
+        LockGuard g #= this.lock.acquire();
+        this.note("PUT " + path + (query.byteLength() > 0 ? "?" + query : ""), metadataJson == null ? "" : metadataJson);
+        if (this.limited()) return FakeKvApi.error(429, 10000, "Rate limited: a key may be written once a second");
+        if (path.indexOf("values/") != 0L) return FakeKvApi.error(404, 7000, "No route for that URI");
+        String key #= FakeKvApi.decode(path.substring(7, path.byteLength()));
+        if (key.byteLength() > 512) return FakeKvApi.error(400, 10033, "key too long: exceeds 512 bytes");
+        int64 now = this.clock.nowSeconds();
+        int64 expiration = 0L;
+        int64 ttl = FakeKvApi.queryNumber(query, "expiration_ttl");
+        if (ttl > 0L) {
+            if (ttl < 60L) return FakeKvApi.error(400, 10033, "expiration_ttl must be at least 60 seconds");
+            expiration = now + ttl;
+        }
+        int64 abs = FakeKvApi.queryNumber(query, "expiration");
+        if (abs > 0L) expiration = abs;
+        int8[] copy = heap int8[len < 1L ? 1L : len];
+        for (int64 i = 0L; i < len; i++) copy[i] = value[i];
+        this.write(key, #copy, len, metadataJson == null ? "" : metadataJson, expiration, now);
+        return FakeKvApi.ok("null");
+    }
+
+    public #KvReply putJson(String path, String json) {
+        LockGuard g #= this.lock.acquire();
+        this.note("PUT " + path, json);
+        if (this.limited()) return FakeKvApi.error(429, 10000, "Rate limited");
+        if (!path.equals("bulk")) return FakeKvApi.error(404, 7000, "No route for that URI");
+        JsonValue root = null;
+        try {
+            root #= Json.parse(json);
+        } catch (JsonParseException e) {
+            return FakeKvApi.error(400, 10001, "Invalid JSON");
+        }
+        if (root.kind() != JsonValue.ARRAY) return FakeKvApi.error(400, 10001, "bulk body must be an array");
+        JsonArray arr = root.array();
+        if (arr.count() > 10000) return FakeKvApi.error(400, 10034, "bulk exceeds the 10000 pair limit");
+        int64 now = this.clock.nowSeconds();
+        for (int32 i = 0; i < arr.count(); i++) {
+            JsonValue item = arr.get(i);
+            if (item.kind() != JsonValue.OBJECT) continue;
+            JsonObject o = item.object();
+            String key #= FakeKvApi.textOf(o, "key");
+            String text #= FakeKvApi.textOf(o, "value");
+            JsonValue b64 = o.get("base64");
+            int8[] bytes = null;
+            if (b64 != null && b64.kind() == JsonValue.BOOLEAN && b64.asBoolean()) {
+                try {
+                    bytes #= Base64.decode(text);
+                } catch (Base64Exception e) {
+                    return FakeKvApi.error(400, 10001, "value is not base64");
+                }
+            } else {
+                bytes #= text.toBytes();
+            }
+            int64 n = (int64) bytes.count();
+            String meta #= "" + "";
+            JsonValue m = o.get("metadata");
+            if (m != null && !m.isNull()) meta #= QueuesJson.stringify(m);
+            int64 expiration = 0L;
+            JsonValue ex = o.get("expiration");
+            if (ex != null && ex.kind() == JsonValue.NUMBER) expiration = ex.asInt64();
+            JsonValue tt = o.get("expiration_ttl");
+            if (tt != null && tt.kind() == JsonValue.NUMBER) expiration = now + tt.asInt64();
+            this.write(key, #bytes, n, meta, expiration, now);
+        }
+        return FakeKvApi.ok("null");
+    }
+
+    public #KvReply delete(String path, String json) {
+        LockGuard g #= this.lock.acquire();
+        this.note("DELETE " + path, json == null ? "" : json);
+        if (this.limited()) return FakeKvApi.error(429, 10000, "Rate limited");
+        int64 now = this.clock.nowSeconds();
+        if (path.equals("bulk")) {
+            JsonValue root = null;
+            try {
+                root #= Json.parse(json);
+            } catch (JsonParseException e) {
+                return FakeKvApi.error(400, 10001, "Invalid JSON");
+            }
+            if (root.kind() != JsonValue.ARRAY) return FakeKvApi.error(400, 10001, "bulk body must be an array");
+            JsonArray arr = root.array();
+            for (int32 i = 0; i < arr.count(); i++) {
+                JsonValue k = arr.get(i);
+                if (k.kind() != JsonValue.STRING) continue;
+                String key #= QueuesJson.text(k);
+                this.remove(key, now);
+            }
+            return FakeKvApi.ok("null");
+        }
+        if (path.indexOf("values/") != 0L) return FakeKvApi.error(404, 7000, "No route for that URI");
+        String key #= FakeKvApi.decode(path.substring(7, path.byteLength()));
+        int32 at = this.find(key);
+        if (at < 0 || !this.present(this.entries.get(at), now)) {
+            return FakeKvApi.error(404, 10009, "delete: 'key not found'");
+        }
+        this.remove(key, now);
+        return FakeKvApi.ok("null");
+    }
+
+    // --- the store ---
+
+    private void write(String key, #int8[] value, int64 len, String metadata, int64 expiration, int64 now) {
+        int32 at = this.find(key);
+        FakeKvEntry e = null;
+        if (at < 0) {
+            FakeKvEntry fresh = heap FakeKvEntry(key);
+            at = this.insertAt(key);
+            this.entries.insert(at, #fresh);
+            e = this.entries.get(at);
+        } else {
+            e = this.entries.get(at);
+            // What a reader sees until the new write propagates is what it sees now.
+            if (this.present(e, now)) {
+                int64 pn = this.seenLen(e, now);
+                e.priorValue #= FakeKvApi.copyOf(this.seenValue(e, now), pn);
+                e.priorLen = pn;
+                e.priorMetadata #= this.seenMetadata(e, now);
+                e.priorExpiration = this.seenExpiration(e, now);
+            } else {
+                e.priorValue = null;
+            }
+        }
+        e.value #= value;
+        e.len = len;
+        e.metadata #= "" + metadata;
+        e.expiration = expiration;
+        e.deleted = false;
+        e.visibleAt = now + this.lagSeconds;
+        return;
+    }
+
+    private void remove(String key, int64 now) {
+        int32 at = this.find(key);
+        if (at < 0) return;
+        FakeKvEntry e = this.entries.get(at);
+        if (this.lagSeconds == 0L) {
+            FakeKvEntry gone #= this.entries.removeAt(at);
+            return;
+        }
+        if (this.present(e, now)) {
+            int64 pn = this.seenLen(e, now);
+            e.priorValue #= FakeKvApi.copyOf(this.seenValue(e, now), pn);
+            e.priorLen = pn;
+            e.priorMetadata #= this.seenMetadata(e, now);
+            e.priorExpiration = this.seenExpiration(e, now);
+        } else {
+            e.priorValue = null;
+        }
+        e.deleted = true;
+        e.visibleAt = now + this.lagSeconds;
+        return;
+    }
+
+    // Is the key readable now: the propagated state, or the prior one before it.
+    private boolean present(FakeKvEntry e, int64 now) {
+        if (now < e.visibleAt) {
+            if (e.priorValue == null) return false;
+            return e.priorExpiration == 0L || e.priorExpiration > now;
+        }
+        if (e.deleted) return false;
+        return e.expiration == 0L || e.expiration > now;
+    }
+
+    static #int8[] copyOf(int8[] src, int64 n) {
+        int8[] copy = heap int8[n < 1L ? 1L : n];
+        for (int64 i = 0L; i < n; i++) copy[i] = src[i];
+        return #copy;
+    }
+
+    private int8[] seenValue(FakeKvEntry e, int64 now) { return now < e.visibleAt ? e.priorValue : e.value; }
+    private int64 seenLen(FakeKvEntry e, int64 now) { return now < e.visibleAt ? e.priorLen : e.len; }
+    private #String seenMetadata(FakeKvEntry e, int64 now) { return "" + (now < e.visibleAt ? e.priorMetadata : e.metadata); }
+    private int64 seenExpiration(FakeKvEntry e, int64 now) { return now < e.visibleAt ? e.priorExpiration : e.expiration; }
+
+    private #KvReply listKeys(String query) {
+        String prefix #= FakeKvApi.decode(FakeKvApi.queryText(query, "prefix"));
+        int64 limit = FakeKvApi.queryNumber(query, "limit");
+        if (limit <= 0L) limit = 1000L;
+        String cursor #= FakeKvApi.queryText(query, "cursor");
+        int32 start = cursor.byteLength() == 0 ? 0 : (int32) FakeKvApi.parse(cursor);
+        int64 now = this.clock.nowSeconds();
+        StringBuilder sb = heap StringBuilder();
+        sb.append("[");
+        int64 given = 0L;
+        int32 i = start;
+        int32 nextIndex = -1;
+        while (i < this.entries.count()) {
+            FakeKvEntry e = this.entries.get(i);
+            if (e.name.indexOf(prefix) == 0L && this.present(e, now)) {
+                if (given >= limit) {
+                    nextIndex = i;
+                    break;
+                }
+                if (given > 0L) sb.append(",");
+                String q #= QueuesJson.quote(e.name);
+                sb.append("{\"name\":" + q);
+                int64 exp = this.seenExpiration(e, now);
+                if (exp > 0L) sb.append(",\"expiration\":" + exp);
+                String m #= this.seenMetadata(e, now);
+                if (m.byteLength() > 0) {
+                    sb.append(",\"metadata\":");
+                    sb.append(m);
+                }
+                sb.append("}");
+                given = given + 1L;
+            }
+            i = i + 1;
+        }
+        sb.append("]");
+        String list #= sb.toString();
+        String info #= nextIndex < 0 ? "{\"count\":" + given + ",\"cursor\":\"\"}" : "{\"count\":" + given + ",\"cursor\":\"" + nextIndex + "\"}";
+        return KvReply.of(200, "{\"success\":true,\"errors\":[],\"messages\":[],\"result\":" + list + ",\"result_info\":" + info + "}");
+    }
+
+    private int32 find(String key) {
+        for (int32 i = 0; i < this.entries.count(); i++) {
+            if (this.entries.get(i).name.equals(key)) return i;
+        }
+        return -1;
+    }
+
+    private int32 insertAt(String key) {
+        int32 i = 0;
+        while (i < this.entries.count() && FakeKvApi.compare(this.entries.get(i).name, key) < 0) i = i + 1;
+        return i;
+    }
+
+    static int32 compare(String a, String b) {
+        int32 n = a.byteLength() < b.byteLength() ? a.byteLength() : b.byteLength();
+        for (int32 i = 0; i < n; i++) {
+            int32 x = ((int32) a.byteAt(i)) & 0xff;
+            int32 y = ((int32) b.byteAt(i)) & 0xff;
+            if (x != y) return x - y;
+        }
+        return a.byteLength() - b.byteLength();
+    }
+
+    private boolean limited() {
+        if (this.rateLimits > 0) {
+            this.rateLimits = this.rateLimits - 1;
+            return true;
+        }
+        return false;
+    }
+
+    private void note(String call, String body) {
+        String c = "" + call;
+        String b = "" + body;
+        this.log.add(#c);
+        this.bodies.add(#b);
+        return;
+    }
+
+    // --- shapes ---
+
+    static #String queryText(String query, String name) {
+        int64 at = 0L;
+        int64 len = query.byteLength();
+        while (at < len) {
+            int64 amp = query.indexOfFrom("&", at);
+            if (amp < 0L) amp = len;
+            String pair #= query.substring((int32) at, (int32) amp);
+            at = amp + 1L;
+            int64 eq = pair.indexOf("=");
+            if (eq < 0L) continue;
+            String k #= pair.substring(0, (int32) eq);
+            if (k.equals(name)) return pair.substring((int32) (eq + 1L), pair.byteLength());
+        }
+        return "" + "";
+    }
+
+    static int64 queryNumber(String query, String name) {
+        String t #= FakeKvApi.queryText(query, name);
+        if (t.byteLength() == 0) return 0L;
+        return FakeKvApi.parse(t);
+    }
+
+    static int64 parse(String s) {
+        int64 v = 0L;
+        for (int32 i = 0; i < s.byteLength(); i++) {
+            int8 c = s.byteAt(i);
+            if (c < (int8) 48 || c > (int8) 57) break;
+            v = v * 10L + (int64) (c - (int8) 48);
+        }
+        return v;
+    }
+
+    /** Percent-decoding of a path segment or query value. */
+    static #String decode(String s) {
+        int32 n = s.byteLength();
+        int8[] out = heap int8[n < 1 ? 1L : (int64) n];
+        int32 o = 0;
+        int32 i = 0;
+        while (i < n) {
+            int32 c = ((int32) s.byteAt(i)) & 0xff;
+            if (c == 37 && i + 2 < n) {
+                int32 hi = FakeKvApi.hex(((int32) s.byteAt(i + 1)) & 0xff);
+                int32 lo = FakeKvApi.hex(((int32) s.byteAt(i + 2)) & 0xff);
+                out[o] = (int8) (hi * 16 + lo);
+                o = o + 1;
+                i = i + 3;
+            } else {
+                out[o] = (int8) c;
+                o = o + 1;
+                i = i + 1;
+            }
+        }
+        return heap String(#out, o);
+    }
+
+    static int32 hex(int32 c) {
+        if (c >= 48 && c <= 57) return c - 48;
+        if (c >= 97 && c <= 102) return c - 87;
+        if (c >= 65 && c <= 70) return c - 55;
+        return 0;
+    }
+
+    static #String textOf(JsonObject o, String name) {
+        JsonValue v = o.get(name);
+        if (v == null || v.kind() != JsonValue.STRING) return "" + "";
+        return QueuesJson.text(v);
+    }
+
+    static #KvReply ok(String result) {
+        return KvReply.of(200, "{\"success\":true,\"errors\":[],\"messages\":[],\"result\":" + result + "}");
+    }
+
+    static #KvReply error(int32 status, int32 code, String message) {
+        return KvReply.of(status, "{\"success\":false,\"errors\":[{\"code\":" + code
+            + ",\"message\":\"" + message + "\"}],\"messages\":[],\"result\":null}");
+    }
+}

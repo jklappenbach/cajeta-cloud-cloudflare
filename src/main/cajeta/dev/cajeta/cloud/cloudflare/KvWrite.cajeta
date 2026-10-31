@@ -1,0 +1,22 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+import dev.cajeta.cloud.kv.PutOptions;
+
+/** One entry of a bulk write: a key, its value and its put options (pass `#options` to hand them over; a lent options object must outlive the write). */
+public final class KvWrite {
+    String name;
+    int8[] data;
+    PutOptions opts;
+
+    public KvWrite(String key, #int8[] value, PutOptions options) {
+        this.name = "" + key;
+        this.data #= value;
+        this.opts #= options;
+        return;
+    }
+
+    public String key() { return this.name; }
+    public int8[] value() { return this.data; }
+    public PutOptions options() { return this.opts; }
+}

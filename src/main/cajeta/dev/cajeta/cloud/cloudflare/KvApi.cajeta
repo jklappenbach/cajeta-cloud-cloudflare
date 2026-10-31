@@ -1,0 +1,18 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+
+/**
+ * Carries one Workers KV REST call under the namespace: `path` is
+ * `values/<key>`, `metadata/<key>`, `keys` or `bulk` (the key already
+ * percent-encoded), `query` the query string without its `?` or "". A
+ * value write carries bytes and, when not null, a metadata JSON text; a bulk
+ * write or delete carries JSON. [[HttpKvApi]] sends them with the API
+ * token; the testkit's FakeKvApi answers in process.
+ */
+public interface KvApi {
+    #KvReply get(String path, String query);
+    #KvReply putValue(String path, String query, int8[] value, int64 len, String metadataJson);
+    #KvReply putJson(String path, String json);
+    #KvReply delete(String path, String json);
+}
