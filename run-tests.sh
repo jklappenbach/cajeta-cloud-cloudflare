@@ -87,7 +87,7 @@ if [[ -z "$cloud_cja" && ! -f "$OLLA_HOME/dev.cajeta.cloud/$(pin_of dev.cajeta.c
 fi
 cloud_cja="$(resolve dev.cajeta.cloud "$cloud_cja")"
 s3_cja="${S3_CJA:-}"
-if [[ -z "$s3_cja" && -d "$S3_REPO" ]]; then
+if [[ -z "$s3_cja" && ! -f "$OLLA_HOME/dev.cajeta.cloud.s3/$(pin_of dev.cajeta.cloud.s3)/dev.cajeta.cloud.s3-$(pin_of dev.cajeta.cloud.s3).cja" && -d "$S3_REPO" ]]; then
     echo ">> building cajeta-cloud-s3 from checkout ($S3_REPO)"
     ( cd "$S3_REPO" && "$CAJETA" build >/dev/null )
     s3_cja="$S3_REPO/build/archive/dev.cajeta.cloud.s3-$(pin_of dev.cajeta.cloud.s3).cja"

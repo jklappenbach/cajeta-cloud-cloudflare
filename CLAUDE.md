@@ -18,10 +18,9 @@ No test reaches Cloudflare by default: R2 runs against `FakeS3` with R2's
 part rule switched on; Access against the fixture certificate set and tokens
 under `src/test/resources/access` (generated once by `generate.py` there,
 never regenerated). The live legs opt in through `CAJETA_R2_TEST_BUCKET`
-and the chain's variables (`cloudflare-live.yml`). `cajeta-cloud-s3` builds
-from a sibling checkout (`S3_REPO`) until its Olla publish is bound (spec
-Q5); `cajeta-cloud` 0.5.1 resolves from Olla (a sibling, `CLOUD_REPO`, only
-when the pin is not in `~/.olla`).
+and the chain's variables (`cloudflare-live.yml`). `cajeta-cloud` 0.5.1 and
+`cajeta-cloud-s3` 0.1.0 resolve from Olla. A sibling checkout (`CLOUD_REPO`,
+`S3_REPO`) builds only when the pin is not in `~/.olla`.
 
 ## Rules
 
