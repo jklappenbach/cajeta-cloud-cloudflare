@@ -11,7 +11,7 @@
 
     "details": {
         "name":               "dev.cajeta.cloud.cloudflare",
-        "version":            "0.1.0",
+        "version":            "0.2.0",
         "description":        "cajeta-cloud-cloudflare — R2, Access, Queues and Workers KV adapters for dev.cajeta.cloud over cajeta-http",
         "license":            "Apache-2.0",
         "authors":            ["Julian Klappenbach"],
@@ -25,13 +25,15 @@
 
         "capabilities": ["env", "network"],
 
-        // cloud 0.5.0 carries the queue and key-value ports (spec Q2); cloud.s3
+        // cloud 0.6.0 makes its memory drivers `memory` components and adds
+        // the object-store selector (plan 7.2.3); 0.5.0 carried the queue and
+        // key-value ports (spec Q2). cloud.s3
         // 0.1.0 is the S3 client R2 is reached through. http, codec and crypto
         // are the transport, the XML and JSON readers, and the JWT signatures
         // (Access). A bare version is a floor within its major.
         "dependencies": {
-            "dev.cajeta.cloud":    "0.5.1",
-            "dev.cajeta.cloud.s3": "0.1.0",
+            "dev.cajeta.cloud":    "0.6.0",
+            "dev.cajeta.cloud.s3": "0.1.1",
             "dev.cajeta.http":     "0.9.1",
             "dev.cajeta.codec":    "0.9.1",
             "dev.cajeta.crypto":   "0.2.0"

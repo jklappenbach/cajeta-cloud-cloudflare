@@ -50,6 +50,8 @@ public final class R2ObjectStore {
         String jurisdiction #= CloudflareChain.jurisdiction(config);
         S3Credentials creds #= CloudflareChain.r2Credentials(config);
         String base #= R2ObjectStore.endpointFor(account, jurisdiction);
+        String over #= CloudflareChain.env("R2_ENDPOINT");
+        if (over != null) base #= #over;
         S3Endpoint where #= S3Endpoint.at(base, R2ObjectStore.SIGNING_REGION(), true);
         S3Config c = heap S3Config(#where, bucket, #creds);
         c.partSize(partSize);

@@ -11,7 +11,7 @@ public class CloudflareTest {
 
     @Test
     public void versionIsTheManifestVersion() {
-        Assert.that(Cloudflare.version()).isEqualTo("0.1.0");
+        Assert.that(Cloudflare.version()).isEqualTo("0.2.0");
         return;
     }
 }

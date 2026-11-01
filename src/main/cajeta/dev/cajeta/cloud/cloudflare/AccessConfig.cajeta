@@ -65,8 +65,14 @@ public final class AccessConfig {
         return "https://" + t + ".cloudflareaccess.com";
     }
 
-    /** The team's certificate set: `<issuer>/cdn-cgi/access/certs`. */
+    /**
+     * The team's certificate set: `<issuer>/cdn-cgi/access/certs`, or
+     * `CLOUDFLARE_ACCESS_CERTS_URL` when it is set (a local fake). The
+     * issuer a token must name does not change.
+     */
     public #String certsUrl() {
+        String over #= CloudflareChain.env("CLOUDFLARE_ACCESS_CERTS_URL");
+        if (over != null) return #over;
         String iss #= this.issuer();
         return iss + "/cdn-cgi/access/certs";
     }

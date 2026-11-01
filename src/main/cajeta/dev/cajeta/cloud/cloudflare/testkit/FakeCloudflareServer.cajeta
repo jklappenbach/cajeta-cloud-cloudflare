@@ -1,0 +1,314 @@
+package dev.cajeta.cloud.cloudflare.testkit;
+
+import cajeta.lang.Slice;
+import cajeta.lang.String;
+import cajeta.time.Duration;
+import dev.cajeta.cloud.cloudflare.KvReply;
+import dev.cajeta.cloud.cloudflare.QueuesReply;
+import dev.cajeta.cloud.identity.SystemTimeSource;
+import dev.cajeta.cloud.identity.TimeSource;
+import dev.cajeta.cloud.s3.S3Reply;
+import dev.cajeta.cloud.s3.S3Request;
+import dev.cajeta.cloud.s3.testkit.FakeS3;
+import dev.cajeta.http.Bytes;
+import dev.cajeta.http.HeaderTable;
+import dev.cajeta.http.HttpRequest;
+import dev.cajeta.http.HttpResponse;
+import dev.cajeta.http.server.HttpServer;
+
+/**
+ * The Cloudflare services over HTTP on a local port, answered by the
+ * in-process fakes, so a program configured only from the environment can
+ * run against them. Point `CLOUDFLARE_API_BASE_URL` at {@link #apiBase},
+ * `R2_ENDPOINT` at {@link #r2Endpoint} and `CLOUDFLARE_ACCESS_CERTS_URL` at
+ * {@link #certsUrl}. It serves:
+ *
+ * - `POST <apiBase>/accounts/<account>/queues/<queue>/<operation>` from a
+ *   FakeQueuesApi, one queue for any id;
+ * - `GET`, `PUT` and `DELETE <apiBase>/accounts/<account>/storage/kv/namespaces/<ns>/<path>`
+ *   from a FakeKvApi, one namespace for any id, with a value-and-metadata
+ *   multipart form split back into its two parts;
+ * - `<r2Endpoint>/<bucket>/<key>` from a FakeS3 with R2's part rule, one
+ *   bucket for any name;
+ * - `GET <certsUrl>` with the certificate set given to {@link #serveCerts}.
+ *
+ * It checks no token or signature. Call {@link #serve} on a fiber and
+ * {@link #shutdown} when done.
+ */
+public final class FakeCloudflareServer {
+    TimeSource clock;
+    FakeQueuesApi queues;
+    FakeKvApi kv;
+    FakeS3 r2;
+    String certs;
+    HttpServer http;
+
+    /** The fakes on the system clock, not yet listening; {@link #open} binds them. */
+    public FakeCloudflareServer() {
+        this.clock = heap SystemTimeSource();
+        this.queues = heap FakeQueuesApi(this.clock);
+        this.kv = heap FakeKvApi(this.clock);
+        this.r2 = heap FakeS3();
+        this.r2.partRule(5242880L, true);
+        this.certs = "{\"keys\":[]}";
+        this.http = null;
+        return;
+    }
+
+    /** A server on `addr` (`127.0.0.1:0` picks a free port). */
+    public static #FakeCloudflareServer open(String addr) {
+        FakeCloudflareServer s = heap FakeCloudflareServer();
+        FakeCloudflareServer.listen(s, addr);
+        return #s;
+    }
+
+    // The handler captures a local bound from a parameter, as primavera's
+    // routes do. A local aliasing `this` reached the handler as a wrong
+    // pointer (2026-11-01).
+    static void listen(FakeCloudflareServer server, String addr) {
+        FakeCloudflareServer target = server;
+        HttpServer h #= HttpServer.bind(addr,
+            (HttpRequest q, HttpResponse r) -> FakeCloudflareServer.handle(target, q, r));
+        server.http #= h;
+        return;
+    }
+
+    public int32 port() { return this.http.server.listener.boundPort(); }
+
+    /** The REST base URL, for `CLOUDFLARE_API_BASE_URL`. */
+    public #String apiBase() { return "http://127.0.0.1:" + this.port() + "/client/v4"; }
+
+    /** The S3 API base URL, for `R2_ENDPOINT`. */
+    public #String r2Endpoint() { return "http://127.0.0.1:" + this.port() + "/r2"; }
+
+    /** The certificate set's URL, for `CLOUDFLARE_ACCESS_CERTS_URL`. */
+    public #String certsUrl() { return "http://127.0.0.1:" + this.port() + "/cdn-cgi/access/certs"; }
+
+    /** Serves `json` as the Access certificate set. */
+    public void serveCerts(String json) {
+        this.certs = "" + json;
+        return;
+    }
+
+    public FakeQueuesApi queues() { return this.queues; }
+    public FakeKvApi kv() { return this.kv; }
+    public FakeS3 r2() { return this.r2; }
+
+    /** Runs the accept loop until {@link #shutdown}. */
+    public void serve() {
+        this.http.serve();
+        return;
+    }
+
+    public boolean shutdown(Duration deadline) { return this.http.shutdown(deadline); }
+
+    static void handle(FakeCloudflareServer s, HttpRequest q, HttpResponse r) {
+        String path #= q.pathString();
+        String method #= Bytes.toString(q.methodBytes());
+        String query = "";
+        if (q.hasQuery()) query #= Bytes.toString(q.query());
+        if (path.equals("/cdn-cgi/access/certs")) {
+            r.status(200).header("Content-Type", "application/json").body(s.certs);
+            return;
+        }
+        if (path.indexOf("/r2/") == 0L) {
+            FakeCloudflareServer.r2Call(s, method, path, query, q, r);
+            return;
+        }
+        int64 qs = path.indexOf("/queues/");
+        int64 kvs = path.indexOf("/storage/kv/namespaces/");
+        if (path.indexOf("/client/v4/accounts/") == 0L && qs > 0L) {
+            // <...>/queues/<queue>/<operation>
+            int64 after = qs + 8L;
+            String rest #= path.substring((int32) after, path.byteLength());
+            int64 slash = rest.indexOf("/");
+            String op #= rest.substring((int32) (slash + 1L), rest.byteLength());
+            String body #= FakeCloudflareServer.bodyText(q);
+            QueuesReply rep #= s.queues.call(op, body);
+            r.status(rep.status()).header("Content-Type", "application/json").body(rep.body());
+            return;
+        }
+        if (path.indexOf("/client/v4/accounts/") == 0L && kvs > 0L) {
+            int64 after = kvs + 23L;
+            String rest #= path.substring((int32) after, path.byteLength());
+            int64 slash = rest.indexOf("/");
+            String kpath #= rest.substring((int32) (slash + 1L), rest.byteLength());
+            FakeCloudflareServer.kvCall(s, method, kpath, query, q, r);
+            return;
+        }
+        r.status(404).body("no such fake endpoint: " + method + " " + path);
+        return;
+    }
+
+    static #String bodyText(HttpRequest q) {
+        if (!q.hasBody()) return "" + "";
+        return Bytes.toString(q.body());
+    }
+
+    static #int8[] bodyBytes(HttpRequest q) {
+        int32 n = q.hasBody() ? q.bodyLength() : 0;
+        int8[] out = heap int8[n < 1 ? 1 : n];
+        if (n > 0) {
+            Slice<int8> b = q.body();
+            for (int32 i = 0; i < n; i++) out[i] = b[i];
+        }
+        return #out;
+    }
+
+    static void kvReply(KvReply rep, HttpResponse r) {
+        r.status(rep.status());
+        r.body(rep.body(), (int32) rep.bodyLength());
+        return;
+    }
+
+    static void kvCall(FakeCloudflareServer s, String method, String kpath, String query,
+                       HttpRequest q, HttpResponse r) {
+        if (method.equals("GET")) {
+            KvReply rep #= s.kv.get(kpath, query);
+            FakeCloudflareServer.kvReply(rep, r);
+            return;
+        }
+        if (method.equals("DELETE")) {
+            String json = null;
+            if (q.hasBody()) json #= FakeCloudflareServer.bodyText(q);
+            KvReply rep #= s.kv.delete(kpath, json);
+            FakeCloudflareServer.kvReply(rep, r);
+            return;
+        }
+        String ctype #= q.headerString("Content-Type");
+        if (ctype != null && ctype.indexOf("application/json") == 0L) {
+            String json #= FakeCloudflareServer.bodyText(q);
+            KvReply rep #= s.kv.putJson(kpath, json);
+            FakeCloudflareServer.kvReply(rep, r);
+            return;
+        }
+        int8[] body #= FakeCloudflareServer.bodyBytes(q);
+        int64 len = q.hasBody() ? (int64) q.bodyLength() : 0L;
+        if (ctype != null && ctype.indexOf("multipart/form-data") == 0L) {
+            int64 b = ctype.indexOf("boundary=");
+            String boundary #= ctype.substring((int32) (b + 9L), ctype.byteLength());
+            String meta #= FakeCloudflareServer.part(body, len, boundary, "metadata");
+            int8[] value #= FakeCloudflareServer.partBytes(body, len, boundary, "value");
+            int64 vlen = FakeCloudflareServer.partLength(body, len, boundary, "value");
+            KvReply rep #= s.kv.putValue(kpath, query, value, vlen, meta);
+            FakeCloudflareServer.kvReply(rep, r);
+            return;
+        }
+        KvReply rep #= s.kv.putValue(kpath, query, body, len, null);
+        FakeCloudflareServer.kvReply(rep, r);
+        return;
+    }
+
+    // Where `needle` starts in body[from..len), or -1.
+    static int64 find(int8[] body, int64 len, int64 from, String needle) {
+        int32 m = needle.byteLength();
+        for (int64 i = from; i + (int64) m <= len; i++) {
+            boolean hit = true;
+            for (int32 j = 0; j < m; j++) {
+                if (body[i + (int64) j] != needle.byteAt(j)) {
+                    hit = false;
+                    break;
+                }
+            }
+            if (hit) return i;
+        }
+        return -1L;
+    }
+
+    // The [start, end) of the named part's content in a multipart form, start -1 when absent.
+    static int64 partStart(int8[] body, int64 len, String boundary, String name) {
+        int64 h = FakeCloudflareServer.find(body, len, 0L, "name=\"" + name + "\"\r\n\r\n");
+        if (h < 0L) return -1L;
+        return h + (int64) name.byteLength() + 11L;
+    }
+
+    static int64 partLength(int8[] body, int64 len, String boundary, String name) {
+        int64 st = FakeCloudflareServer.partStart(body, len, boundary, name);
+        if (st < 0L) return 0L;
+        int64 end = FakeCloudflareServer.find(body, len, st, "\r\n--" + boundary);
+        if (end < 0L) end = len;
+        return end - st;
+    }
+
+    static #int8[] partBytes(int8[] body, int64 len, String boundary, String name) {
+        int64 st = FakeCloudflareServer.partStart(body, len, boundary, name);
+        int64 n = FakeCloudflareServer.partLength(body, len, boundary, name);
+        int8[] out = heap int8[n < 1L ? 1L : n];
+        for (int64 i = 0L; i < n; i++) out[i] = body[st + i];
+        return #out;
+    }
+
+    static #String part(int8[] body, int64 len, String boundary, String name) {
+        int64 n = FakeCloudflareServer.partLength(body, len, boundary, name);
+        if (FakeCloudflareServer.partStart(body, len, boundary, name) < 0L) return null;
+        int8[] b #= FakeCloudflareServer.partBytes(body, len, boundary, name);
+        return heap String(#b, (int32) n);
+    }
+
+    static void r2Call(FakeCloudflareServer s, String method, String path, String query,
+                       HttpRequest q, HttpResponse r) {
+        // /r2/<bucket>/<key>; the bucket is any name.
+        String rest #= path.substring(4, path.byteLength());
+        int64 slash = rest.indexOf("/");
+        String key = "";
+        if (slash >= 0L) {
+            int8[] raw #= rest.substring((int32) (slash + 1L), rest.byteLength()).toBytes();
+            key #= Bytes.percentDecode(raw[0:(int32) raw.count()]);
+        }
+        S3Request req = heap S3Request(method, key);
+        FakeCloudflareServer.queryInto(req, query);
+        HeaderTable h = q.headers();
+        for (int32 i = 0; i < h.count(); i++) {
+            String n #= Bytes.toString(h.nameAt(i));
+            String v #= Bytes.toString(h.valueAt(i));
+            req.header(n, v);
+        }
+        int8[] body = null;
+        if (q.hasBody()) {
+            body #= FakeCloudflareServer.bodyBytes(q);
+            req.body(body, (int64) q.bodyLength());
+        }
+        S3Reply rep #= s.r2.send(req);
+        r.status(rep.status());
+        String[] keep = ["ETag", "Content-Type", "Content-Range", "Last-Modified"];
+        for (int32 i = 0; i < keep.count(); i++) {
+            String v #= rep.headerOr(keep[i]);
+            if (v != null && v.byteLength() > 0) r.header(keep[i], v);
+        }
+        if (method.equals("HEAD")) {
+            String cl #= rep.headerOr("Content-Length");
+            if (cl != null && cl.byteLength() > 0) r.header("Content-Length", cl);
+            return;
+        }
+        if (rep.bodyLength() > 0L) r.body(rep.body(), (int32) rep.bodyLength());
+        return;
+    }
+
+    static void queryInto(S3Request req, String query) {
+        if (query.byteLength() == 0) return;
+        int32 at = 0;
+        int32 n = query.byteLength();
+        while (at <= n) {
+            int32 end = at;
+            while (end < n && query.byteAt(end) != (int8) 38) end = end + 1;
+            String pair #= query.substring(at, end);
+            if (pair.byteLength() > 0) {
+                int64 eq = pair.indexOf("=");
+                String name = "";
+                String value = "";
+                if (eq < 0L) {
+                    int8[] nb #= pair.toBytes();
+                    name #= Bytes.percentDecode(nb[0:(int32) nb.count()]);
+                } else {
+                    int8[] nb #= pair.substring(0, (int32) eq).toBytes();
+                    int8[] vb #= pair.substring((int32) (eq + 1L), pair.byteLength()).toBytes();
+                    name #= Bytes.percentDecode(nb[0:(int32) nb.count()]);
+                    value #= Bytes.percentDecode(vb[0:(int32) vb.count()]);
+                }
+                req.query(name, value);
+            }
+            at = end + 1;
+        }
+        return;
+    }
+}

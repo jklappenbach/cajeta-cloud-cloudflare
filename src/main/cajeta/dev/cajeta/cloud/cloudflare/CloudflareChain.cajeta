@@ -115,6 +115,24 @@ public final class CloudflareChain {
             + ": the jurisdictions are eu and fedramp, or unset for the default location");
     }
 
+    /**
+     * The REST API's base URL, `https://api.cloudflare.com/client/v4` unless
+     * `CLOUDFLARE_API_BASE_URL` names another (a local fake, a proxy). No
+     * trailing slash.
+     */
+    public static #String apiBase() {
+        String v #= CloudflareChain.env("CLOUDFLARE_API_BASE_URL");
+        if (v == null) return "" + "https://api.cloudflare.com/client/v4";
+        return CloudflareChain.trimSlash(v);
+    }
+
+    /** `s` without one trailing slash. */
+    static #String trimSlash(String s) {
+        int32 n = s.byteLength();
+        if (n > 0 && s.byteAt(n - 1) == (int8) 47) return s.substring(0, n - 1);
+        return "" + s;
+    }
+
     // The variable's value, or null when it is unset or empty.
     static #String env(String name) {
         String v #= System.env.get(name);

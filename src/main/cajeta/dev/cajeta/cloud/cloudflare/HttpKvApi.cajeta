@@ -28,9 +28,20 @@ public final class HttpKvApi implements KvApi {
         return;
     }
 
+    /** The API at `apiBase` instead of Cloudflare's, such as a FakeCloudflareServer's `apiBase()`. */
+    public static #HttpKvApi at(String apiBase, String accountId, String namespaceId, String apiToken) {
+        HttpKvApi api = heap HttpKvApi(accountId, namespaceId, apiToken);
+        api.base #= HttpKvApi.urlAt(apiBase, accountId, namespaceId, "");
+        return #api;
+    }
+
     public static #String urlFor(String accountId, String namespaceId, String path) {
-        return "https://api.cloudflare.com/client/v4/accounts/" + accountId + "/storage/kv/namespaces/"
-            + namespaceId + "/" + path;
+        return HttpKvApi.urlAt("https://api.cloudflare.com/client/v4", accountId, namespaceId, path);
+    }
+
+    /** `urlFor` under another base URL. */
+    public static #String urlAt(String apiBase, String accountId, String namespaceId, String path) {
+        return apiBase + "/accounts/" + accountId + "/storage/kv/namespaces/" + namespaceId + "/" + path;
     }
 
     /** A key as a path segment: unreserved bytes kept, everything else percent-encoded. */

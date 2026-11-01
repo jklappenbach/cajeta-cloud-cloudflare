@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0
+
+On `dev.cajeta.cloud` 0.6.0, whose memory drivers are now `memory` components, and `dev.cajeta.cloud.s3` 0.1.1, whose stores keep their transport. Every R2 store from 0.1.0 read a freed transport on its first request.
+
+- R2 is the `cloudflare` object-store component, `CloudflareObjectStore`, so `OBJECT_STORE_PROVIDER=cloudflare` selects it. It connects on first use to the bucket `R2_BUCKET` names and refuses, naming the variable, when it is unset.
+- `CLOUDFLARE_API_BASE_URL` points the Queues and KV adapters at another REST base URL, `R2_ENDPOINT` points R2 at another S3 endpoint, and `CLOUDFLARE_ACCESS_CERTS_URL` points Access at another certificate set. Each defaults to Cloudflare's own. `HttpQueuesApi.at` and `HttpKvApi.at` take a base URL in code.
+- `FakeCloudflareServer` in the testkit serves the Queues, KV, R2 and Access certificate endpoints over HTTP from the in-process fakes, so a program configured only from the environment can run against them.
+- A program with these adapters compiled in now holds two implementations of each port, so outside a test or dev profile it must name every provider.
+
 ## 0.1.0 (2026-11-01)
 
 - R2 behind the object-store port: `R2ObjectStore.connect(bucket, config)` derives the endpoint from the account id and optional jurisdiction (`eu`, `fedramp`), signs for region `auto` in path style, and opens the shared `S3ObjectStore` under the R2 profile: equal 5 MiB parts but the last, R2's own error codes, conditional writes undeclared until spec Q1 (`R2_CONDITIONAL_WRITES=1` declares them).

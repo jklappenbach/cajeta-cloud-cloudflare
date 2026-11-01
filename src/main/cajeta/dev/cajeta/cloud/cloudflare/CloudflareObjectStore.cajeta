@@ -1,0 +1,113 @@
+package dev.cajeta.cloud.cloudflare;
+
+import cajeta.lang.String;
+import dev.cajeta.cloud.Capabilities;
+import dev.cajeta.cloud.CloudStats;
+import dev.cajeta.cloud.object.CondResult;
+import dev.cajeta.cloud.object.ListPage;
+import dev.cajeta.cloud.object.MultipartUpload;
+import dev.cajeta.cloud.object.ObjectReader;
+import dev.cajeta.cloud.object.ObjectStore;
+import dev.cajeta.cloud.object.ObjectWriter;
+import dev.cajeta.cloud.object.StatResult;
+import dev.cajeta.cloud.s3.S3ObjectStore;
+
+/**
+ * R2 behind the object-store port as the `cloudflare` component, so
+ * `ObjectStoreSelector` finds it and `OBJECT_STORE_PROVIDER=cloudflare`
+ * selects it. On first use it connects to the bucket `R2_BUCKET` names
+ * through `R2ObjectStore.connect`, with the account, keys, jurisdiction and
+ * `R2_ENDPOINT` from the environment. Construction does nothing, so a
+ * program that selects another provider never touches Cloudflare.
+ */
+@Component(name = "cloudflare")
+public final class CloudflareObjectStore implements ObjectStore {
+    S3ObjectStore inner;
+    boolean ready;
+
+    /** The `cloudflare` component: configured from the environment on first use. */
+    public CloudflareObjectStore() {
+        this.ready = false;
+        return;
+    }
+
+    private void ensure() {
+        if (this.ready) return;
+        String bucket #= CloudflareChain.env("R2_BUCKET");
+        if (bucket == null) {
+            throw heap CloudflareConfigurationException("no R2 bucket: R2_BUCKET is not set");
+        }
+        this.inner #= R2ObjectStore.connect(bucket, null);
+        this.ready = true;
+    }
+
+    public Capabilities capabilities() {
+        this.ensure();
+        return this.inner.capabilities();
+    }
+
+    public CloudStats stats() {
+        this.ensure();
+        return this.inner.stats();
+    }
+
+    public #String put(String key, int8[] bytes, String contentType) {
+        this.ensure();
+        return this.inner.put(key, bytes, contentType);
+    }
+
+    public #int8[] get(String key) {
+        this.ensure();
+        return this.inner.get(key);
+    }
+
+    public #StatResult stat(String key) {
+        this.ensure();
+        return this.inner.stat(key);
+    }
+
+    public #int8[] getRange(String key, int64 offset, int64 length) {
+        this.ensure();
+        return this.inner.getRange(key, offset, length);
+    }
+
+    public boolean delete(String key) {
+        this.ensure();
+        return this.inner.delete(key);
+    }
+
+    public #String copy(String srcKey, String dstKey) {
+        this.ensure();
+        return this.inner.copy(srcKey, dstKey);
+    }
+
+    public #ListPage list(String prefix, String delimiter, String token, int64 maxKeys) {
+        this.ensure();
+        return this.inner.list(prefix, delimiter, token, maxKeys);
+    }
+
+    public #ObjectReader openRead(String key) {
+        this.ensure();
+        return this.inner.openRead(key);
+    }
+
+    public #ObjectWriter openWrite(String key, String contentType) {
+        this.ensure();
+        return this.inner.openWrite(key, contentType);
+    }
+
+    public #MultipartUpload beginMultipart(String key, String contentType) {
+        this.ensure();
+        return this.inner.beginMultipart(key, contentType);
+    }
+
+    public #CondResult putIfAbsent(String key, int8[] bytes, String contentType) {
+        this.ensure();
+        return this.inner.putIfAbsent(key, bytes, contentType);
+    }
+
+    public #CondResult putIfMatch(String key, int8[] bytes, String contentType, String etag) {
+        this.ensure();
+        return this.inner.putIfMatch(key, bytes, contentType, etag);
+    }
+}

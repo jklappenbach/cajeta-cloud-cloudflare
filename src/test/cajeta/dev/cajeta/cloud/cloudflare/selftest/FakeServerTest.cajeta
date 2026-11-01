@@ -1,0 +1,147 @@
+package dev.cajeta.cloud.cloudflare.selftest;
+
+import cajeta.lang.String;
+import cajeta.time.Duration;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.cloud.cloudflare.CloudflareChain;
+import dev.cajeta.cloud.cloudflare.CloudflareConfigurationException;
+import dev.cajeta.cloud.cloudflare.CloudflareKeyValue;
+import dev.cajeta.cloud.cloudflare.CloudflareObjectStore;
+import dev.cajeta.cloud.cloudflare.CloudflareQueue;
+import dev.cajeta.cloud.cloudflare.HttpKvApi;
+import dev.cajeta.cloud.cloudflare.HttpQueuesApi;
+import dev.cajeta.cloud.cloudflare.R2ObjectStore;
+import dev.cajeta.cloud.cloudflare.testkit.FakeCloudflareServer;
+import dev.cajeta.cloud.kv.KvEntry;
+import dev.cajeta.cloud.kv.PutOptions;
+import dev.cajeta.cloud.object.StatResult;
+import dev.cajeta.cloud.queue.MessageAttributes;
+import dev.cajeta.cloud.queue.Received;
+import dev.cajeta.cloud.s3.S3Config;
+import dev.cajeta.cloud.s3.S3Credentials;
+import dev.cajeta.cloud.s3.S3Endpoint;
+import dev.cajeta.cloud.s3.S3ObjectStore;
+import dev.cajeta.http.ClientResponse;
+import dev.cajeta.http.client.HttpClient;
+
+/**
+ * The testkit's FakeCloudflareServer (plan 7.1.4): each adapter, pointed at
+ * the server's URLs the way the environment overrides point it, completes a
+ * round trip over real HTTP. The `cloudflare` object-store component refuses
+ * naming R2_BUCKET when it is unset, and the REST base URL defaults to
+ * Cloudflare's when CLOUDFLARE_API_BASE_URL is unset.
+ */
+public class FakeServerTest {
+
+    public FakeServerTest() {
+        return;
+    }
+
+    static async int32 serveLoop(FakeCloudflareServer s) {
+        s.serve();
+        return 1;
+    }
+
+    static async int32 queueTrip(FakeCloudflareServer s) {
+        String base #= s.apiBase();
+        HttpQueuesApi api #= HttpQueuesApi.at(base, "acct", "q-1", "token");
+        CloudflareQueue q #= CloudflareQueue.over(#api);
+        int8[] body #= "hello".toBytes();
+        MessageAttributes attrs = heap MessageAttributes();
+        String id #= q.send(body, attrs, 0L);
+        Received r #= q.receive(10, 30L);
+        if (r.count() != 1) return 0;
+        String got = "" + r.messageAt(0).body().count();
+        q.ack(r.messageAt(0).receipt());
+        return got.equals("5") && s.queues().pending() == 0 ? 1 : 0;
+    }
+
+    static async int32 kvTrip(FakeCloudflareServer s) {
+        String base #= s.apiBase();
+        HttpKvApi api #= HttpKvApi.at(base, "acct", "ns-1", "token");
+        CloudflareKeyValue kv #= CloudflareKeyValue.over(#api);
+        int8[] v #= "value-1".toBytes();
+        PutOptions o = heap PutOptions();
+        o.metadata("{\"n\":1}");
+        kv.put("a/b c", v, o);
+        KvEntry e #= kv.get("a/b c");
+        if (e == null) return 0;
+        String meta = "" + e.metadata();
+        boolean gone = kv.delete("a/b c");
+        KvEntry after #= kv.get("a/b c");
+        return e.value().count() == 7 && meta.indexOf("\"n\"") >= 0L && after == null ? 1 : 0;
+    }
+
+    static int32 r2Trip(FakeCloudflareServer s) {
+        String base #= s.r2Endpoint();
+        S3Endpoint where #= S3Endpoint.at(base, R2ObjectStore.SIGNING_REGION(), true);
+        S3Credentials creds = heap S3Credentials("AKIDFAKE", "secret", null);
+        S3Config c = heap S3Config(#where, "bucket-1", #creds);
+        S3ObjectStore store #= S3ObjectStore.open(c, R2ObjectStore.profile(false));
+        int8[] bytes #= "object body".toBytes();
+        String etag #= store.put("dir/one two.txt", bytes, "text/plain");
+        int8[] got #= store.get("dir/one two.txt");
+        StatResult st #= store.stat("dir/one two.txt");
+        boolean deleted = store.delete("dir/one two.txt");
+        return got.count() == 11 && st.exists && st.size == 11L && deleted ? 1 : 0;
+    }
+
+    static async int32 certsTrip(FakeCloudflareServer s) {
+        s.serveCerts("{\"keys\":[{\"kid\":\"k1\"}]}");
+        HttpClient client #= heap HttpClient();
+        String url #= s.certsUrl();
+        ClientResponse r #= client.get(url);
+        String body #= r.bodyString();
+        return r.status() == 200 && body.indexOf("\"k1\"") >= 0L ? 1 : 0;
+    }
+
+    @Test
+    public void eachAdapterRoundTripsOverHttp() {
+        FakeCloudflareServer s #= FakeCloudflareServer.open("127.0.0.1:0");
+        Assert.isTrue(s.port() > 0);
+        int32 queue = 0;
+        int32 kv = 0;
+        int32 r2 = 0;
+        int32 certs = 0;
+        scope {
+            Task<int32> sv = spawn serveLoop(s);
+            Task<int32> tq = spawn queueTrip(s);
+            queue = await tq;
+            Task<int32> tk = spawn kvTrip(s);
+            kv = await tk;
+            r2 = FakeServerTest.r2Trip(s);
+            Task<int32> tc = spawn certsTrip(s);
+            certs = await tc;
+            s.shutdown(Duration.ofSeconds(2));
+            Assert.equals(1, await sv);
+        }
+        // Asserted after shutdown, so a failed trip cannot leave the server running.
+        Assert.equals(1, queue);
+        Assert.equals(1, kv);
+        Assert.equals(1, r2);
+        Assert.equals(1, certs);
+        return;
+    }
+
+    @Test
+    public void theObjectStoreComponentNamesAMissingBucket() {
+        CloudflareObjectStore store = heap CloudflareObjectStore();
+        String why = "";
+        try {
+            int8[] got #= store.get("k");
+        } catch (CloudflareConfigurationException e) {
+            why = "" + e.getMessage();
+        }
+        Assert.isTrue(why.indexOf("R2_BUCKET") >= 0L);
+        return;
+    }
+
+    @Test
+    public void theApiBaseDefaultsToCloudflare() {
+        String base #= CloudflareChain.apiBase();
+        Assert.equals("https://api.cloudflare.com/client/v4", base);
+        String url #= HttpKvApi.urlAt("http://127.0.0.1:9/client/v4", "a", "n", "keys");
+        Assert.equals("http://127.0.0.1:9/client/v4/accounts/a/storage/kv/namespaces/n/keys", url);
+        return;
+    }
+}

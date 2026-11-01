@@ -30,7 +30,8 @@ import dev.cajeta.cloud.queue.Received;
  *
  * As the `cloudflare` component it configures itself on first use from
  * CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_QUEUE_ID and the queues token of the
- * chain (CLOUDFLARE_QUEUES_API_TOKEN, else CLOUDFLARE_API_TOKEN).
+ * chain (CLOUDFLARE_QUEUES_API_TOKEN, else CLOUDFLARE_API_TOKEN), at
+ * CLOUDFLARE_API_BASE_URL when it is set.
  * Construction does nothing.
  */
 @Component(name = "cloudflare")
@@ -73,7 +74,8 @@ public final class CloudflareQueue implements MessageQueue {
         if (queue == null) {
             throw heap CloudflareConfigurationException("no Cloudflare queue: CLOUDFLARE_QUEUE_ID is not set");
         }
-        this.api = heap HttpQueuesApi(account, queue, token);
+        String base #= CloudflareChain.apiBase();
+        this.api #= HttpQueuesApi.at(base, account, queue, token);
         this.ready = true;
     }
 

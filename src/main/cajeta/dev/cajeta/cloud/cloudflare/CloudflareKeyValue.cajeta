@@ -86,7 +86,8 @@ public final class CloudflareKeyValue implements KeyValueStore {
         if (ns == null) {
             throw heap CloudflareConfigurationException("no Workers KV namespace: CLOUDFLARE_KV_NAMESPACE_ID is not set");
         }
-        this.api = heap HttpKvApi(account, ns, token);
+        String base #= CloudflareChain.apiBase();
+        this.api #= HttpKvApi.at(base, account, ns, token);
         this.ready = true;
     }
 

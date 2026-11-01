@@ -26,9 +26,20 @@ public final class HttpQueuesApi implements QueuesApi {
         return;
     }
 
+    /** The API at `apiBase` instead of Cloudflare's, such as a FakeCloudflareServer's `apiBase()`. */
+    public static #HttpQueuesApi at(String apiBase, String accountId, String queueId, String apiToken) {
+        HttpQueuesApi api = heap HttpQueuesApi(accountId, queueId, apiToken);
+        api.base #= HttpQueuesApi.urlAt(apiBase, accountId, queueId, "");
+        return #api;
+    }
+
     public static #String urlFor(String accountId, String queueId, String operation) {
-        return "https://api.cloudflare.com/client/v4/accounts/" + accountId + "/queues/" + queueId
-            + "/" + operation;
+        return HttpQueuesApi.urlAt("https://api.cloudflare.com/client/v4", accountId, queueId, operation);
+    }
+
+    /** `urlFor` under another base URL. */
+    public static #String urlAt(String apiBase, String accountId, String queueId, String operation) {
+        return apiBase + "/accounts/" + accountId + "/queues/" + queueId + "/" + operation;
     }
 
     public #QueuesReply call(String operation, String jsonBody) {
