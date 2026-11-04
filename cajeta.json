@@ -20,7 +20,7 @@
 
     "settings": {
         "toolchain": {
-            "version": "0.48.0"
+            "version": "0.50.0"
         },
 
         "capabilities": ["env", "network"],
